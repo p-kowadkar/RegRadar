@@ -31,47 +31,71 @@ if _ENV_FILE.exists():
 # ════════════════════════════════════════════════════════════════
 
 REQUIRED_VARS: list[str] = [
-    # Google Cloud / Vertex AI
+    # Google Cloud / Vertex AI -- the LLM workhorse
     "GOOGLE_CLOUD_PROJECT",
     "GOOGLE_CLOUD_LOCATION",
     "GOOGLE_GENAI_USE_VERTEXAI",
-    # OpenRouter fallback
+    # OpenRouter -- LLM fallback for resilience
     "OPENROUTER_API_KEY",
-    # ClickHouse
+    # ClickHouse -- single data store for everything
     "CLICKHOUSE_HOST",
     "CLICKHOUSE_PORT",
     "CLICKHOUSE_USER",
-    # password can be empty for local; not in REQUIRED
-    # Scraping
+    # CLICKHOUSE_PASSWORD can be empty for local; not required
+    # Nimble -- regulatory scraping (primary)
     "NIMBLE_API_KEY",
+    # Firecrawl -- silent fallback scraper
     "FIRECRAWL_API_KEY",
-    # Observability
+    # Datadog -- LLM observability + control breach alerts
     "DD_API_KEY",
     "DD_SITE",
+    # Senso -- cited.md publishing (required for prize track)
+    "SENSO_API_KEY",
+    # x402 -- monetization rail (required for "Monetize" demo beat)
+    # Optional vars below; not in REQUIRED to keep the app bootable without them
 ]
 
-# Optional vars with defaults
+# Optional vars with defaults (auto-applied if unset)
 DEFAULTS: dict[str, str] = {
+    # ClickHouse
     "CLICKHOUSE_PASSWORD": "",
     "CLICKHOUSE_SECURE": "false",
     "CLICKHOUSE_DATABASE": "regradar",
+    "CLICKHOUSE_PORT": "8123",
+    # Model selection
+    "GEMINI_MODEL_DEFAULT": "gemini-3.5-flash",
+    "GEMINI_MODEL_REASONING": "gemini-3.1-pro",
+    "GEMINI_EMBEDDING_MODEL": "gemini-embedding-001",
+    # OpenRouter
+    "OPENROUTER_BASE_URL": "https://openrouter.ai/api/v1",
+    # Datadog
     "DD_SERVICE": "regradar-backend",
     "DD_ENV": "hackathon",
     "DD_LLMOBS_ENABLED": "1",
     "DD_LLMOBS_AGENTLESS_ENABLED": "1",
     "DD_LLMOBS_ML_APP": "regradar",
+    # Senso
+    "SENSO_BASE_URL": "https://apiv2.senso.ai",
+    "SENSO_PUBLISH_NAMESPACE": "regradar",
+    # x402 (defaults to base mainnet; switch to base-sepolia for testnet)
+    "X402_FACILITATOR_URL": "https://x402.org/facilitator",
+    "X402_NETWORK": "base",
+    "X402_PRICE_USDC_PER_BRIEF": "0.001",
+    # App
     "APP_ENV": "development",
     "APP_PORT": "8000",
     "APP_LOG_LEVEL": "INFO",
     "APP_CORS_ORIGINS": "http://localhost:5173,http://localhost:3000",
     "APP_WS_HEARTBEAT_SECONDS": "30",
-    "WATCHER_API_POLL_INTERVAL_SECONDS": "900",
-    "WATCHER_SCRAPE_INTERVAL_SECONDS": "3600",
-    "AGENT_MAX_PER_MESSAGE": "3",
-    "AGENT_PRIMARY_THRESHOLD": "0.85",
-    "AGENT_SUPPORTING_THRESHOLD": "0.65",
-    "AGENT_CROSS_TALK_THRESHOLD": "0.50",
-    "AUDITOR_REJECT_BLOCKS_DELIVERY": "true",
+    # Agents (the 4: Policy Crawler, Impact Analysis, Auditor, Monitoring)
+    "POLICY_CRAWLER_INTERVAL_SECONDS": "3600",
+    "MONITORING_AGENT_INTERVAL_SECONDS": "86400",
+    "EVENT_POLLER_INTERVAL_MS": "500",
+    "IMPACT_AGENT_TIMEOUT_SECONDS": "30",
+    "AUDITOR_TIMEOUT_SECONDS": "15",
+    "AUDITOR_REJECT_BLOCKS_PUBLISH": "true",
+    "AUDITOR_APPROVE_THRESHOLD": "0.85",
+    "AUDITOR_WARN_THRESHOLD": "0.65",
 }
 
 
@@ -91,8 +115,8 @@ def validate() -> None:
         raise RuntimeError(
             "Missing required environment variables:\n"
             + "\n".join(f"  - {v}" for v in missing)
-            + f"\n\nCopy .env.example to .env and fill them in.\n"
-            f"See docs/DEPLOYMENT.md for details."
+            + "\n\nCopy .env.example to .env and fill them in.\n"
+              "See docs/DEPLOYMENT.md for details."
         )
 
     # Apply defaults for unset optional vars
@@ -130,7 +154,7 @@ def get_float(name: str, default: Optional[float] = None) -> float:
 
 
 def get_bool(name: str, default: bool = False) -> bool:
-    """Get an env var as bool. Truthy strings: true, 1, yes."""
+    """Get an env var as bool. Truthy strings: true, 1, yes, on."""
     raw = os.environ.get(name)
     if raw is None or raw == "":
         return default

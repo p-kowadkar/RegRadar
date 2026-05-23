@@ -1,34 +1,33 @@
 # INTEGRATIONS.md
 
-How each sponsor connects to RegRadar. Every integration is a file in `backend/integrations/`. Every integration is async. Every integration is wrapped in try/except with structured fallbacks.
-
-This is a Level 3 spec. AI tools building this should implement each integration as described, with the exact function signatures, error handling, and observability hooks.
+How each external service connects to RegRadar. Every integration is a file in `backend/integrations/`. Every integration is async, singleton + lazy-init, structured-logged, and Pydantic-typed on the boundary.
 
 ---
 
 ## Table of Contents
 
-1. [Vertex AI (Gemini + Check Grounding)](#1-vertex-ai-gemini--check-grounding)
-2. [OpenRouter (LLM Fallback)](#2-openrouter-llm-fallback)
-3. [ClickHouse (Data Layer)](#3-clickhouse-data-layer)
-4. [Nimble (Web Scraping -- Primary)](#4-nimble-web-scraping--primary)
-5. [Firecrawl (Web Scraping -- Silent Fallback)](#5-firecrawl-web-scraping--silent-fallback)
-6. [Datadog (LLM Observability + Monitoring)](#6-datadog-llm-observability--monitoring)
-7. [Luminai (Workflow Execution)](#7-luminai-workflow-execution)
-8. [Cross-Cutting: The Integration Contract](#8-cross-cutting-the-integration-contract)
+1. [Vertex AI -- Gemini + Check Grounding](#1-vertex-ai----gemini--check-grounding)
+2. [OpenRouter -- LLM Fallback](#2-openrouter----llm-fallback)
+3. [ClickHouse -- Data Layer](#3-clickhouse----data-layer)
+4. [Nimble -- Web Search Agents (primary scraping)](#4-nimble----web-search-agents-primary-scraping)
+5. [Firecrawl -- Silent Fallback Scraper](#5-firecrawl----silent-fallback-scraper)
+6. [Datadog -- LLM Observability + Control Alerts](#6-datadog----llm-observability--control-alerts)
+7. [Senso -- Publish to cited.md](#7-senso----publish-to-citedmd)
+8. [x402 -- USDC Micropayments for Compliance Briefs](#8-x402----usdc-micropayments-for-compliance-briefs)
+9. [Cross-Cutting: The Integration Contract](#9-cross-cutting-the-integration-contract)
 
 ---
 
-## 1. Vertex AI (Gemini + Check Grounding)
+## 1. Vertex AI -- Gemini + Check Grounding
 
 **File:** `backend/integrations/vertex_ai.py`
 
-**Purpose:** Sole entry point for all Gemini calls AND the Check Grounding API. Every other module imports from here. Centralization is what lets Datadog auto-instrumentation capture every LLM call uniformly.
+**Purpose:** Sole entry point for Pydantic AI's Vertex provider AND the Check Grounding API. Every other module imports from here. Centralization is what lets ddtrace auto-instrumentation capture every LLM call uniformly.
 
 ### Setup
 
 ```bash
-pip install --upgrade google-genai google-cloud-discoveryengine
+pip install --upgrade pydantic-ai google-genai google-cloud-discoveryengine
 gcloud auth application-default login
 gcloud config set project gen-lang-client-0677154031
 ```
@@ -40,116 +39,112 @@ gcloud config set project gen-lang-client-0677154031
 | `GOOGLE_CLOUD_PROJECT` | yes | `gen-lang-client-0677154031` |
 | `GOOGLE_CLOUD_LOCATION` | yes | `us-central1` |
 | `GOOGLE_GENAI_USE_VERTEXAI` | yes | `True` |
-| `GEMINI_API_KEY` | optional | for fast API-key auth in scripts |
+| `GEMINI_MODEL_DEFAULT` | no | default `gemini-3.5-flash` |
+| `GEMINI_MODEL_REASONING` | no | default `gemini-3.1-pro` (used by Auditor) |
+| `GEMINI_EMBEDDING_MODEL` | no | default `gemini-embedding-001` |
+| `GEMINI_API_KEY` | no | for quick scripts (ADC preferred for app) |
 
 ### Interface
 
 ```python
 # backend/integrations/vertex_ai.py
-from google import genai
-from google.genai import types
-from typing import Type, TypeVar
-from pydantic import BaseModel
-import structlog
+"""Vertex AI integration: Pydantic AI model wrapper + embeddings + Check Grounding."""
+
+from __future__ import annotations
+
 import os
+from typing import Any
 
-log = structlog.get_logger()
-T = TypeVar("T", bound=BaseModel)
+from google import genai
+from google.cloud import discoveryengine_v1
+from pydantic import BaseModel
+from pydantic_ai.models.google import GoogleModel
+from pydantic_ai.providers.google_vertex import GoogleVertexProvider
+
+from backend.utils.logging import get_logger
+
+log = get_logger(__name__)
 
 
-class VertexAIClient:
-    """Singleton wrapper around Gemini + Check Grounding."""
-    
-    _instance: "VertexAIClient | None" = None
-    
-    def __init__(self):
-        self.client = genai.Client(
+# ════════════════════════════════════════════════════════════════
+# Pydantic AI provider (lazy singleton)
+# ════════════════════════════════════════════════════════════════
+
+_PROVIDER: GoogleVertexProvider | None = None
+_GENAI_CLIENT: genai.Client | None = None
+_GROUNDING_CLIENT: discoveryengine_v1.GroundedGenerationServiceAsyncClient | None = None
+
+
+def _get_provider() -> GoogleVertexProvider:
+    """Pydantic AI's Vertex provider. Used to build typed agents."""
+    global _PROVIDER
+    if _PROVIDER is None:
+        _PROVIDER = GoogleVertexProvider(
+            project_id=os.environ["GOOGLE_CLOUD_PROJECT"],
+            region=os.environ["GOOGLE_CLOUD_LOCATION"],
+        )
+        log.info("vertex_ai.provider_initialized")
+    return _PROVIDER
+
+
+def vertex_model(model_name: str | None = None) -> GoogleModel:
+    """
+    Returns a Pydantic AI GoogleModel for a Vertex AI Gemini model.
+
+    Args:
+        model_name: e.g. "gemini-3.5-flash" or "gemini-3.1-pro".
+                    Defaults to env var GEMINI_MODEL_DEFAULT.
+    """
+    model_name = model_name or os.environ.get("GEMINI_MODEL_DEFAULT", "gemini-3.5-flash")
+    return GoogleModel(model_name=model_name, provider=_get_provider())
+
+
+# ════════════════════════════════════════════════════════════════
+# Direct google-genai client (for embeddings + grounded search)
+# Used outside Pydantic AI agents -- e.g., the Policy Crawler's
+# regulation-text embedding step.
+# ════════════════════════════════════════════════════════════════
+
+
+def _get_genai_client() -> genai.Client:
+    global _GENAI_CLIENT
+    if _GENAI_CLIENT is None:
+        _GENAI_CLIENT = genai.Client(
             vertexai=True,
             project=os.environ["GOOGLE_CLOUD_PROJECT"],
             location=os.environ["GOOGLE_CLOUD_LOCATION"],
         )
-        self.fallback_provider = "openrouter"  # see openrouter.py
-        log.info("vertex_ai.initialized")
-    
-    @classmethod
-    def get(cls) -> "VertexAIClient":
-        if cls._instance is None:
-            cls._instance = cls()
-        return cls._instance
-    
-    async def generate(
-        self,
-        *,
-        model: str,                          # e.g. "gemini-3.5-flash"
-        prompt: str,
-        system_instruction: str | None = None,
-        response_schema: Type[T] | None = None,
-        thinking_level: str = "medium",      # "low", "medium", "high"
-        max_output_tokens: int = 2048,
-        agent_id: str | None = None,         # for Datadog tagging
-    ) -> str | T:
-        """
-        Single entry for all Gemini calls.
-        
-        If response_schema is set, returns parsed Pydantic model.
-        Else returns raw string.
-        
-        Tagged with agent_id for Datadog LLM Obs grouping.
-        """
-        config_kwargs = {
-            "max_output_tokens": max_output_tokens,
-            "thinking_config": types.ThinkingConfig(
-                thinking_level=thinking_level
-            ),
-        }
-        if system_instruction:
-            config_kwargs["system_instruction"] = system_instruction
-        if response_schema:
-            config_kwargs["response_mime_type"] = "application/json"
-            config_kwargs["response_schema"] = response_schema
-        
-        try:
-            response = await self.client.aio.models.generate_content(
-                model=model,
-                contents=prompt,
-                config=types.GenerateContentConfig(**config_kwargs),
-            )
-            log.info("vertex_ai.success",
-                     agent=agent_id,
-                     model=model,
-                     tokens_in=response.usage_metadata.prompt_token_count,
-                     tokens_out=response.usage_metadata.candidates_token_count)
-            
-            if response_schema:
-                return response.parsed
-            return response.text
-        except Exception as e:
-            log.error("vertex_ai.failure", agent=agent_id,
-                      model=model, error=str(e))
-            raise
-    
-    async def check_grounding(
-        self,
-        *,
-        claim: str,
-        sources: list[str],
-    ) -> "GroundingResult":
-        """
-        Vertex AI Check Grounding API.
-        Returns whether the claim is supported by the provided sources,
-        with per-source confidence scores.
-        
-        Used exclusively by The Auditor.
-        """
-        # Implementation uses discoveryengine_v1 GroundedGenerationServiceClient
-        # See: https://cloud.google.com/generative-ai-app-builder/docs/check-grounding
-        ...
-```
+        log.info("vertex_ai.genai_client_initialized")
+    return _GENAI_CLIENT
 
-### Pydantic Models for Grounding
 
-```python
-# In backend/data/models.py
+async def embed_text(
+    *,
+    text: str,
+    model: str | None = None,
+    output_dim: int = 768,
+) -> list[float]:
+    """
+    Embed text via gemini-embedding-001 with Matryoshka truncation.
+
+    output_dim must be one of: 768, 1536, 3072 (the natively-supported
+    Matryoshka prefixes).
+    """
+    model = model or os.environ.get("GEMINI_EMBEDDING_MODEL", "gemini-embedding-001")
+    client = _get_genai_client()
+    response = await client.aio.models.embed_content(
+        model=model,
+        contents=text,
+        config={"output_dimensionality": output_dim},
+    )
+    return response.embeddings[0].values
+
+
+# ════════════════════════════════════════════════════════════════
+# Vertex AI Check Grounding (the Auditor's spine)
+# ════════════════════════════════════════════════════════════════
+
+
 class GroundingCitation(BaseModel):
     source_id: str
     confidence: float
@@ -161,406 +156,456 @@ class GroundingResult(BaseModel):
     is_grounded: bool
     overall_confidence: float
     citations: list[GroundingCitation]
+
+
+async def check_grounding(*, claim: str, sources: list[str]) -> GroundingResult:
+    """
+    Call the Vertex AI Check Grounding API to verify a claim against sources.
+
+    Returns a confidence score in [0, 1] and per-citation supporting text.
+    Used exclusively by the Auditor agent.
+
+    See: https://cloud.google.com/generative-ai-app-builder/docs/check-grounding
+    """
+    global _GROUNDING_CLIENT
+    if _GROUNDING_CLIENT is None:
+        _GROUNDING_CLIENT = discoveryengine_v1.GroundedGenerationServiceAsyncClient()
+
+    project = os.environ["GOOGLE_CLOUD_PROJECT"]
+    parent = f"projects/{project}/locations/global"
+
+    request = discoveryengine_v1.CheckGroundingRequest(
+        grounding_config=f"{parent}/groundingConfigs/default_grounding_config",
+        answer_candidate=claim,
+        facts=[
+            discoveryengine_v1.GroundingFact(
+                fact_text=src,
+                attributes={"source_id": f"src_{i}"},
+            )
+            for i, src in enumerate(sources)
+        ],
+        grounding_spec=discoveryengine_v1.CheckGroundingSpec(citation_threshold=0.6),
+    )
+
+    response = await _GROUNDING_CLIENT.check_grounding(request=request)
+    log.info(
+        "vertex_ai.grounding_check",
+        confidence=response.support_score,
+        is_grounded=response.support_score >= 0.65,
+        n_citations=len(response.cited_chunks),
+    )
+    return GroundingResult(
+        claim=claim,
+        is_grounded=response.support_score >= 0.65,
+        overall_confidence=response.support_score,
+        citations=[
+            GroundingCitation(
+                source_id=c.sources[0].source_id if c.sources else "unknown",
+                confidence=getattr(c, "score", 0.0),
+                supporting_text=getattr(c, "text", ""),
+            )
+            for c in response.cited_chunks
+        ],
+    )
 ```
 
-### Why Singleton
+### Why Pydantic AI Vertex provider (not raw `google-genai`)
 
-The `VertexAIClient.get()` pattern ensures:
-- One `genai.Client` instance per process (avoids socket exhaustion)
-- Datadog auto-instrumentation hooks once
-- Centralized error handling and logging
+Pydantic AI wraps `google-genai` and adds:
+- Typed input/output via Pydantic models
+- Tool calling via `@agent.tool` decorator
+- Native async support
+- ddtrace auto-instrumentation hooks
+- Conversation history management
 
-### Failure Modes
+Each of the 3 LLM-using agents (`policy_crawler`, `impact_analysis`, `auditor`) is a Pydantic AI `Agent` instance using `vertex_model(...)` as its underlying model. See [AGENTS.md](AGENTS.md) for the full agent definitions.
+
+### Failure modes & fallback
 
 | Failure | Detection | Action |
 |---|---|---|
-| Rate limit (429) | exception with code 429 | retry 2x with exponential backoff, then fall back to OpenRouter |
-| Quota exceeded | exception with code 8 | log + fall back to OpenRouter immediately |
-| Timeout (>30s) | asyncio.TimeoutError | retry once, then fall back |
-| Invalid response schema | JSON parse error | re-prompt with stricter instructions, then mark agent output `confidence=0` and continue |
+| Rate limit (429) | `google.api_core.exceptions.ResourceExhausted` | Retry 2x w/ exp backoff, then fall back to OpenRouter |
+| Quota exceeded | `ResourceExhausted` w/ quota code | Log + fall back to OpenRouter immediately |
+| Timeout (>30s) | `asyncio.TimeoutError` | Retry once, then fall back |
+| Invalid response schema | Pydantic `ValidationError` | Re-prompt with stricter instructions, then mark agent output `confidence=0` |
 
-### Datadog Hooks
+Pydantic AI handles structured-output parsing automatically; if Gemini's JSON doesn't validate against the declared `output_type`, it auto-retries with the schema in the prompt.
 
-When `ddtrace-run` is in use (always), the `google-genai` SDK is auto-instrumented. Each call generates an LLM span automatically. The `agent_id` keyword arg is captured as a custom tag via `LLMObs.annotate()` -- see `backend/utils/logging.py`.
+### Datadog hooks
+
+`ddtrace>=4.8` auto-instruments `pydantic-ai>=1.63` AND `google-genai>=2.0`. Every agent run becomes an LLM Obs span. Every tool call becomes a child span. Pydantic AI agents show as nodes in the AI Agent Console. No manual instrumentation required.
 
 ---
 
-## 2. OpenRouter (LLM Fallback)
+## 2. OpenRouter -- LLM Fallback
 
 **File:** `backend/integrations/openrouter.py`
 
-**Purpose:** Used ONLY when Vertex AI fails (rate limit, quota, timeout). Never the primary path. Demo never explicitly mentions this -- it's resilience insurance.
+**Purpose:** Used ONLY when Vertex AI fails (rate limit, quota, timeout). Never the primary path. The demo never mentions OpenRouter -- it's resilience insurance.
 
 ### Setup
 
 ```bash
-pip install openai  # OpenRouter uses OpenAI-compatible API
+# OpenRouter uses OpenAI-compatible API; openai SDK already in requirements.txt
 ```
 
 ### Environment Variables
 
 | Var | Required | Notes |
 |---|---|---|
-| `OPENROUTER_API_KEY` | yes | from openrouter.ai/keys |
-| `OPENROUTER_BASE_URL` | yes | `https://openrouter.ai/api/v1` |
+| `OPENROUTER_API_KEY` | yes | From [openrouter.ai/keys](https://openrouter.ai/keys) |
+| `OPENROUTER_BASE_URL` | no | Default `https://openrouter.ai/api/v1` |
 
 ### Interface
 
 ```python
 # backend/integrations/openrouter.py
-from openai import AsyncOpenAI
+"""OpenRouter fallback. Used only when Vertex AI rate-limits or times out."""
+
 import os
-import structlog
+from openai import AsyncOpenAI
+from backend.utils.logging import get_logger
 
-log = structlog.get_logger()
+log = get_logger(__name__)
 
 
-# Model mapping: Vertex AI name → OpenRouter name
+# Vertex AI name -> OpenRouter name
 MODEL_MAP = {
-    "gemini-3.5-flash": "google/gemini-2.5-flash",         # closest match
-    "gemini-3.1-pro": "google/gemini-2.5-pro",             # closest match
+    "gemini-3.5-flash": "google/gemini-3.5-flash",
+    "gemini-3.1-pro": "google/gemini-3.1-pro",
 }
 
 
-class OpenRouterClient:
-    _instance: "OpenRouterClient | None" = None
-    
-    def __init__(self):
-        self.client = AsyncOpenAI(
+_CLIENT: AsyncOpenAI | None = None
+
+
+def _get_client() -> AsyncOpenAI:
+    global _CLIENT
+    if _CLIENT is None:
+        _CLIENT = AsyncOpenAI(
             api_key=os.environ["OPENROUTER_API_KEY"],
-            base_url=os.environ["OPENROUTER_BASE_URL"],
+            base_url=os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
         )
         log.info("openrouter.initialized")
-    
-    @classmethod
-    def get(cls) -> "OpenRouterClient":
-        if cls._instance is None:
-            cls._instance = cls()
-        return cls._instance
-    
-    async def generate(
-        self,
-        *,
-        model: str,
-        prompt: str,
-        system_instruction: str | None = None,
-        response_format: dict | None = None,
-        max_output_tokens: int = 2048,
-        agent_id: str | None = None,
-    ) -> str:
-        """
-        Fallback LLM call. Returns raw text only (no Pydantic parsing).
-        Parsing happens upstream after retry.
-        """
-        or_model = MODEL_MAP.get(model, model)
-        messages = []
-        if system_instruction:
-            messages.append({"role": "system", "content": system_instruction})
-        messages.append({"role": "user", "content": prompt})
-        
-        try:
-            response = await self.client.chat.completions.create(
-                model=or_model,
-                messages=messages,
-                max_tokens=max_output_tokens,
-                response_format=response_format,
-            )
-            log.info("openrouter.fallback_success",
-                     agent=agent_id, model=or_model)
-            return response.choices[0].message.content
-        except Exception as e:
-            log.error("openrouter.failure", agent=agent_id, error=str(e))
-            raise
+    return _CLIENT
+
+
+async def generate_fallback(
+    *,
+    model: str,
+    system_prompt: str | None,
+    user_prompt: str,
+    max_tokens: int = 2048,
+    response_format: dict | None = None,
+) -> str:
+    """
+    Fallback LLM call. Returns raw text only (no Pydantic parsing).
+    Parsing happens upstream in the Pydantic AI agent that's wrapping the fallback.
+    """
+    or_model = MODEL_MAP.get(model, model)
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": user_prompt})
+
+    response = await _get_client().chat.completions.create(
+        model=or_model,
+        messages=messages,
+        max_tokens=max_tokens,
+        response_format=response_format,
+    )
+    log.info("openrouter.fallback_success", model=or_model, tokens=response.usage.total_tokens)
+    return response.choices[0].message.content
 ```
 
-### Fallback Decision Logic
+### Fallback decision logic
 
-```python
-# Inside vertex_ai.py -- when an exception is caught
-from backend.integrations.openrouter import OpenRouterClient
-
-try:
-    return await self._call_vertex(...)
-except (RateLimitError, QuotaExceededError, asyncio.TimeoutError):
-    log.warning("vertex_ai.falling_back_to_openrouter", agent=agent_id)
-    return await OpenRouterClient.get().generate(...)
-```
+Wrap each agent run with a try/except that intercepts Vertex AI rate-limit / quota / timeout errors and re-runs via OpenRouter. See `backend/agents/policy_crawler.py` and others for the exact pattern.
 
 ---
 
-## 3. ClickHouse (Data Layer)
+## 3. ClickHouse -- Data Layer
 
 **File:** `backend/integrations/clickhouse_client.py`
 
-**Purpose:** Sole data layer. KG + portfolios + controls + audit + embeddings -- all here. Never bypass this wrapper.
+**Purpose:** Sole data layer. Credit card accounts + embeddings + policy_changes + schema_events + behavior_events + impact_reports + auditor_verdicts + compliance_scans + published_briefs + dd_alerts + x402_fetches -- all here.
 
 ### Setup
 
 ```bash
-pip install clickhouse-connect[arrow]
+pip install "clickhouse-connect[arrow]>=0.8.0"   # 0.8+ for 25.8 vector_similarity index
 ```
 
 ### Environment Variables
 
 | Var | Required | Example |
 |---|---|---|
-| `CLICKHOUSE_HOST` | yes | `xxx.us-east-1.aws.clickhouse.cloud` |
-| `CLICKHOUSE_PORT` | yes | `8443` (HTTPS) |
+| `CLICKHOUSE_HOST` | yes | `localhost` or `xxx.us-east-1.aws.clickhouse.cloud` |
+| `CLICKHOUSE_PORT` | yes | `8123` (HTTP) or `8443` (HTTPS Cloud) |
 | `CLICKHOUSE_USER` | yes | `default` |
-| `CLICKHOUSE_PASSWORD` | yes | secret |
-| `CLICKHOUSE_SECURE` | yes | `true` |
-| `CLICKHOUSE_DATABASE` | yes | `regradar` |
+| `CLICKHOUSE_PASSWORD` | no | empty for local |
+| `CLICKHOUSE_SECURE` | no | `false` for local, `true` for Cloud |
+| `CLICKHOUSE_DATABASE` | no | default `regradar` |
 
 ### Interface
 
 ```python
 # backend/integrations/clickhouse_client.py
-import clickhouse_connect
+"""Async ClickHouse client. All data access goes through repositories.py
+which uses this client. Don't bypass."""
+
 import os
-import structlog
-from typing import Any
+import clickhouse_connect
+from clickhouse_connect.driver.asyncclient import AsyncClient
 
-log = structlog.get_logger()
+from backend.utils.logging import get_logger
+
+log = get_logger(__name__)
 
 
-class ClickHouseClient:
-    """Sync + async access to ClickHouse."""
-    
-    _sync_instance: "ClickHouseClient | None" = None
-    _async_client = None
-    
-    def __init__(self):
-        self.sync_client = clickhouse_connect.get_client(
+_ASYNC_CLIENT: AsyncClient | None = None
+
+
+async def get_client() -> AsyncClient:
+    """Async client (lazy-init). Same client used across all repositories."""
+    global _ASYNC_CLIENT
+    if _ASYNC_CLIENT is None:
+        _ASYNC_CLIENT = await clickhouse_connect.get_async_client(
             host=os.environ["CLICKHOUSE_HOST"],
             port=int(os.environ["CLICKHOUSE_PORT"]),
             username=os.environ["CLICKHOUSE_USER"],
-            password=os.environ["CLICKHOUSE_PASSWORD"],
-            secure=os.environ.get("CLICKHOUSE_SECURE", "true").lower() == "true",
+            password=os.environ.get("CLICKHOUSE_PASSWORD", ""),
+            secure=os.environ.get("CLICKHOUSE_SECURE", "false").lower() == "true",
             database=os.environ.get("CLICKHOUSE_DATABASE", "regradar"),
         )
-        log.info("clickhouse.initialized",
-                 host=os.environ["CLICKHOUSE_HOST"])
-    
-    @classmethod
-    def get_sync(cls) -> "ClickHouseClient":
-        if cls._sync_instance is None:
-            cls._sync_instance = cls()
-        return cls._sync_instance
-    
-    @classmethod
-    async def get_async(cls):
-        """Async client (lazy-init)."""
-        if cls._async_client is None:
-            cls._async_client = await clickhouse_connect.get_async_client(
-                host=os.environ["CLICKHOUSE_HOST"],
-                port=int(os.environ["CLICKHOUSE_PORT"]),
-                username=os.environ["CLICKHOUSE_USER"],
-                password=os.environ["CLICKHOUSE_PASSWORD"],
-                secure=os.environ.get("CLICKHOUSE_SECURE", "true").lower() == "true",
-                database=os.environ.get("CLICKHOUSE_DATABASE", "regradar"),
-            )
-        return cls._async_client
-    
-    def query(self, sql: str, params: dict | None = None) -> Any:
-        """Sync query for setup / seed data scripts."""
-        return self.sync_client.query(sql, parameters=params or {})
-    
-    async def aquery(self, sql: str, params: dict | None = None) -> Any:
-        """Async query for agent execution."""
-        client = await self.get_async()
-        return await client.query(sql, parameters=params or {})
-    
-    def insert_df(self, table: str, df) -> None:
-        """Bulk insert pandas DataFrame (used by seed scripts)."""
-        self.sync_client.insert_df(table, df)
-    
-    async def ainsert(self, table: str, rows: list[list]) -> None:
-        """Async row insert."""
-        client = await self.get_async()
-        await client.insert(table, rows)
+        log.info("clickhouse.initialized", host=os.environ["CLICKHOUSE_HOST"])
+    return _ASYNC_CLIENT
 ```
 
-### Repository Pattern
+### Vector search quirk (25.8+)
 
-All agents query through `backend/data/repositories.py`, NOT directly through `ClickHouseClient`. See `docs/DATA_MODEL.md` for repository function signatures.
+The `vector_similarity` index type with HNSW is GA in ClickHouse 25.8. Two things you must do:
 
-### Vector Search Quirk
-
-ClickHouse vector functions require the `Array(Float32)` type. Always cast embeddings:
+1. **Cast the query vector to `Array(Float32)`** -- otherwise the index isn't used:
 
 ```sql
--- Correct
 SELECT cosineDistance(embedding, [0.1, 0.2, ...]::Array(Float32)) AS dist
-FROM kg_nodes ORDER BY dist LIMIT 10;
+FROM policy_embeddings ORDER BY dist LIMIT 5;
 ```
 
-### Connection Pooling
+2. **Don't use deprecated index types.** ClickHouse 25.8 removed `annoy` and `usearch` -- use only `TYPE vector_similarity('hnsw', '<distance>', <dim>)`:
 
-`clickhouse-connect` handles HTTP connection pooling internally. No need for extra config -- the default pool size of 8 is fine for hackathon scope.
+```sql
+ALTER TABLE policy_embeddings
+ADD INDEX embedding_hnsw_idx embedding
+TYPE vector_similarity('hnsw', 'cosineDistance', 768)
+GRANULARITY 1;
+```
+
+### Connection pooling
+
+`clickhouse-connect` handles HTTP connection pooling internally. Default pool size of 8 is fine for hackathon scope.
 
 ---
 
-## 4. Nimble (Web Scraping -- Primary)
+## 4. Nimble -- Web Search Agents (primary scraping)
 
 **File:** `backend/integrations/nimble.py`
 
-**Purpose:** Primary scraper for The Watcher. Hits SEC EDGAR, CFTC, FINRA, OCC, CFPB, FinCEN, state regulators. Returns structured markdown for Classifier.
+**Purpose:** Primary regulatory scraper for the Policy Crawler. Hits CFPB, FRB, FTC, Federal Register, state regulators. Returns structured content.
+
+### Why Nimble specifically
+
+Nimble raised a $47M Series B in Feb 2026 and repositioned from "scraping API" to **Web Search Agents Platform** -- competing with Exa, Tavily, Parallel. Their pitch: AI agents searching the web in real-time with verification + structured output. This is exactly our use case for the Policy Crawler. The platform offers:
+
+- `/search` -- $1 per 1,000 search inputs
+- `/search` with `answer=true` -- $4 per 1,000 (LLM-grounded reasoning over results)
+- `/extract` -- structured data from any URL
+- `/crawl` -- multi-page expansion from a seed URL
+- `/map` -- domain tree for discovery
 
 ### Setup
 
 ```bash
-pip install nimble-python
+pip install "nimble-sdk>=1.0.0"
 ```
 
 ### Environment Variables
 
 | Var | Required | Notes |
 |---|---|---|
-| `NIMBLE_API_KEY` | yes | from nimbleway.com dashboard |
-
-5,000 page free trial. After that, $1 per 1,000 pages. We'll use ~500 pages during the hackathon.
+| `NIMBLE_API_KEY` | yes | From [nimbleway.com](https://www.nimbleway.com) dashboard |
 
 ### Interface
 
 ```python
 # backend/integrations/nimble.py
-from nimble_python import Nimble
+"""Nimble Web Search Agents Platform integration.
+
+Primary scraping path for the Policy Crawler. Hits regulatory sources
+(CFPB, FRB, FTC, Federal Register) and returns structured content.
+
+Failover: if a Nimble call raises NimbleError, the caller invokes
+FirecrawlClient as the silent fallback (see firecrawl.py).
+"""
+
+from __future__ import annotations
+
+import asyncio
 import os
-import structlog
+from datetime import datetime, timezone
+from hashlib import sha256
 from typing import Literal
-from backend.data.models import ScrapedDocument
 
-log = structlog.get_logger()
+from nimble_sdk import Nimble                     # the Series B SDK
+from pydantic import BaseModel
+
+from backend.utils.logging import get_logger
+
+log = get_logger(__name__)
 
 
-class NimbleClient:
-    _instance: "NimbleClient | None" = None
-    
-    def __init__(self):
-        self.client = Nimble(api_key=os.environ["NIMBLE_API_KEY"])
+# ════════════════════════════════════════════════════════════════
+# Output types
+# ════════════════════════════════════════════════════════════════
+
+
+class ScrapedDocument(BaseModel):
+    source_url: str
+    content_markdown: str
+    content_hash: str
+    scraped_at: datetime
+    scraper_used: Literal["nimble", "firecrawl"]
+
+
+class SearchResult(BaseModel):
+    url: str
+    title: str
+    snippet: str
+    content_markdown: str | None = None
+
+
+# ════════════════════════════════════════════════════════════════
+# Client
+# ════════════════════════════════════════════════════════════════
+
+
+_CLIENT: Nimble | None = None
+
+
+def _get_client() -> Nimble:
+    global _CLIENT
+    if _CLIENT is None:
+        _CLIENT = Nimble(api_key=os.environ["NIMBLE_API_KEY"])
         log.info("nimble.initialized")
-    
-    @classmethod
-    def get(cls) -> "NimbleClient":
-        if cls._instance is None:
-            cls._instance = cls()
-        return cls._instance
-    
-    async def scrape_url(
-        self,
-        *,
-        url: str,
-        parsing_type: Literal["markdown", "html", "json"] = "markdown",
-        agent_id: str = "watcher",
-    ) -> ScrapedDocument:
-        """
-        Scrape a single URL. Returns ScrapedDocument.
-        Raises NimbleError on failure -- caller decides whether to fall back to Firecrawl.
-        """
-        try:
-            # Note: nimble_python is sync; wrap in asyncio.to_thread
-            import asyncio
-            result = await asyncio.to_thread(
-                self.client.web.scrape,
-                url=url,
-                parsing_type=parsing_type,
-            )
-            log.info("nimble.scrape_success",
-                     url=url, content_length=len(result.content))
-            return ScrapedDocument(
-                source_url=url,
-                content=result.content,
-                content_hash=self._hash(result.content),
-                scraped_at=datetime.utcnow(),
-                scraper_used="nimble",
-            )
-        except Exception as e:
-            log.error("nimble.scrape_failure", url=url, error=str(e))
-            raise NimbleError(str(e)) from e
-    
-    async def search(
-        self,
-        *,
-        query: str,
-        num_results: int = 10,
-        deep_search: bool = True,
-        parsing_type: str = "markdown",
-    ) -> list[ScrapedDocument]:
-        """
-        Search the web. Used for ad-hoc regulatory lookups by The Mapper.
-        """
-        import asyncio
+    return _CLIENT
+
+
+async def scrape_url(url: str) -> ScrapedDocument:
+    """
+    Scrape a single URL via Nimble's /extract endpoint.
+    Returns markdown-formatted content.
+
+    Raises NimbleError on failure -- caller decides whether to fall back to Firecrawl.
+    """
+    try:
+        # Nimble SDK is sync; wrap in to_thread
         result = await asyncio.to_thread(
-            self.client.search,
+            _get_client().extract,
+            url=url,
+            output_format="markdown",
+        )
+        content = result.content or ""
+        h = sha256(content.encode()).hexdigest()
+        log.info("nimble.scrape_success", url=url, content_length=len(content))
+        return ScrapedDocument(
+            source_url=url,
+            content_markdown=content,
+            content_hash=h,
+            scraped_at=datetime.now(timezone.utc),
+            scraper_used="nimble",
+        )
+    except Exception as e:
+        log.error("nimble.scrape_failure", url=url, error=str(e))
+        raise NimbleError(str(e)) from e
+
+
+async def search(
+    *,
+    query: str,
+    num_results: int = 5,
+    use_answer: bool = False,
+) -> list[SearchResult]:
+    """
+    Search the web via Nimble's /search endpoint.
+
+    Args:
+        query: search query, 1-6 words usually best
+        num_results: max results
+        use_answer: if True, use Nimble's "Answer" mode ($4/1000 instead of $1/1000)
+                    which returns grounded reasoning over results. Use sparingly.
+    """
+    try:
+        result = await asyncio.to_thread(
+            _get_client().search,
             query=query,
             num_results=num_results,
-            deep_search=deep_search,
-            parsing_type=parsing_type,
+            answer=use_answer,
         )
+        log.info("nimble.search_success", query=query, n=len(result.results))
         return [
-            ScrapedDocument(
-                source_url=item.url,
-                content=item.content if hasattr(item, "content") else item.snippet,
-                content_hash=self._hash(item.content if hasattr(item, "content") else item.snippet),
-                scraped_at=datetime.utcnow(),
-                scraper_used="nimble",
+            SearchResult(
+                url=r.url,
+                title=r.title,
+                snippet=r.snippet,
+                content_markdown=getattr(r, "content_markdown", None),
             )
-            for item in result.results
+            for r in result.results
         ]
-    
-    @staticmethod
-    def _hash(content: str) -> str:
-        import hashlib
-        return hashlib.sha256(content.encode()).hexdigest()
+    except Exception as e:
+        log.error("nimble.search_failure", query=query, error=str(e))
+        raise NimbleError(str(e)) from e
 
 
 class NimbleError(Exception):
-    """Raised on Nimble scrape failure -- triggers Firecrawl fallback."""
+    """Raised on Nimble scrape/search failure. Triggers Firecrawl fallback."""
     pass
 ```
 
-### Scrape Targets (Hardcoded for Hackathon)
+### Scrape targets
 
 ```python
-# Used by The Watcher
-NIMBLE_SCRAPE_TARGETS = [
-    # SEC
-    "https://www.sec.gov/news/pressreleases",
-    "https://www.sec.gov/rules/proposed.shtml",
-    # CFTC
-    "https://www.cftc.gov/PressRoom/PressReleases",
-    # FINRA
-    "https://www.finra.org/rules-guidance/notices",
-    # OCC
-    "https://occ.gov/news-issuances/bulletins",
-    # CFPB
-    "https://www.consumerfinance.gov/rules-policy/",
-    # FinCEN
-    "https://www.fincen.gov/news/news-releases",
-    # NY DFS
-    "https://www.dfs.ny.gov/industry_guidance",
-    # ... ~16 total
+# Used by backend/agents/policy_crawler.py
+NIMBLE_TARGETS = [
+    # CFPB -- the primary regulator for credit card consumer protection
+    ("https://www.consumerfinance.gov/rules-policy/final-rules/", "CFPB"),
+    ("https://www.consumerfinance.gov/rules-policy/notices-opportunities-comment/", "CFPB"),
+    # FRB -- the Federal Reserve issues TILA interpretations
+    ("https://www.federalreserve.gov/supervisionreg/srletters/srletters.htm", "FRB"),
+    # FTC -- co-enforces FCRA with CFPB
+    ("https://www.ftc.gov/legal-library/browse/cases-proceedings/business-blog", "FTC"),
+    # Federal Register -- the authoritative source of final rules
+    ("https://www.federalregister.gov/agencies/consumer-financial-protection-bureau", "Federal Register"),
+    # ~10 targets total. Keeps the demo's scrape volume small enough to stay within Nimble free tier.
 ]
 ```
 
-See `docs/SEED_DATA.md` for the complete list.
+### Failure → fallback trigger
 
-### Failure → Fallback Trigger
-
-If `NimbleError` is raised, `backend/agents/watcher.py` catches it and immediately tries `FirecrawlClient` for the same URL. The user never sees the failure.
+If `NimbleError` is raised, `backend/agents/policy_crawler.py` catches it and immediately tries `FirecrawlClient` for the same URL. The user (and the demo audience) never sees the failure.
 
 ---
 
-## 5. Firecrawl (Web Scraping -- Silent Fallback)
+## 5. Firecrawl -- Silent Fallback Scraper
 
 **File:** `backend/integrations/firecrawl.py`
 
-**Purpose:** Silent backup. Never mentioned in the demo. Used only when Nimble fails.
+**Purpose:** Silent backup for Nimble. Never mentioned in the demo. Used only when Nimble fails.
 
 ### Setup
 
 ```bash
-pip install firecrawl-py
+pip install "firecrawl-py>=1.6.7"
 ```
 
 ### Environment Variables
@@ -573,155 +618,155 @@ pip install firecrawl-py
 
 ```python
 # backend/integrations/firecrawl.py
-from firecrawl import FirecrawlApp
+"""Firecrawl silent fallback. Used only when Nimble fails."""
+
+import asyncio
 import os
-import structlog
-from datetime import datetime
-from backend.data.models import ScrapedDocument
+from datetime import datetime, timezone
+from hashlib import sha256
 
-log = structlog.get_logger()
+from firecrawl import FirecrawlApp
+
+from backend.integrations.nimble import ScrapedDocument
+from backend.utils.logging import get_logger
+
+log = get_logger(__name__)
 
 
-class FirecrawlClient:
-    _instance: "FirecrawlClient | None" = None
-    
-    def __init__(self):
-        self.app = FirecrawlApp(api_key=os.environ["FIRECRAWL_API_KEY"])
+_CLIENT: FirecrawlApp | None = None
+
+
+def _get_client() -> FirecrawlApp:
+    global _CLIENT
+    if _CLIENT is None:
+        _CLIENT = FirecrawlApp(api_key=os.environ["FIRECRAWL_API_KEY"])
         log.info("firecrawl.initialized")
-    
-    @classmethod
-    def get(cls) -> "FirecrawlClient":
-        if cls._instance is None:
-            cls._instance = cls()
-        return cls._instance
-    
-    async def scrape_url(self, url: str) -> ScrapedDocument:
-        """Same interface as NimbleClient.scrape_url -- drop-in replacement."""
-        import asyncio
-        try:
-            result = await asyncio.to_thread(
-                self.app.scrape_url,
-                url,
-                params={"formats": ["markdown"]},
-            )
-            log.info("firecrawl.fallback_scrape_success", url=url)
-            content = result.get("markdown", "")
-            return ScrapedDocument(
-                source_url=url,
-                content=content,
-                content_hash=self._hash(content),
-                scraped_at=datetime.utcnow(),
-                scraper_used="firecrawl",
-            )
-        except Exception as e:
-            log.error("firecrawl.fallback_failure", url=url, error=str(e))
-            raise
-    
-    @staticmethod
-    def _hash(content: str) -> str:
-        import hashlib
-        return hashlib.sha256(content.encode()).hexdigest()
+    return _CLIENT
+
+
+async def scrape_url(url: str) -> ScrapedDocument:
+    """Same return type as nimble.scrape_url -- drop-in fallback."""
+    try:
+        result = await asyncio.to_thread(
+            _get_client().scrape_url,
+            url,
+            params={"formats": ["markdown"]},
+        )
+        content = result.get("markdown", "")
+        h = sha256(content.encode()).hexdigest()
+        log.info("firecrawl.fallback_scrape_success", url=url, content_length=len(content))
+        return ScrapedDocument(
+            source_url=url,
+            content_markdown=content,
+            content_hash=h,
+            scraped_at=datetime.now(timezone.utc),
+            scraper_used="firecrawl",
+        )
+    except Exception as e:
+        log.error("firecrawl.fallback_failure", url=url, error=str(e))
+        raise
 ```
 
-### Watcher Failover Pattern
+### Failover pattern
 
 ```python
-# Inside backend/agents/watcher.py
-from backend.integrations.nimble import NimbleClient, NimbleError
-from backend.integrations.firecrawl import FirecrawlClient
+# Inside backend/agents/policy_crawler.py
+from backend.integrations import nimble, firecrawl
 
-async def scrape_with_failover(url: str) -> ScrapedDocument:
+async def scrape_with_failover(url: str):
     try:
-        return await NimbleClient.get().scrape_url(url=url)
-    except NimbleError:
-        log.warning("watcher.nimble_failed_using_firecrawl", url=url)
-        return await FirecrawlClient.get().scrape_url(url)
+        return await nimble.scrape_url(url)
+    except nimble.NimbleError:
+        log.warning("scrape.nimble_failed_falling_back_to_firecrawl", url=url)
+        return await firecrawl.scrape_url(url)
 ```
 
 ---
 
-## 6. Datadog (LLM Observability + Monitoring)
+## 6. Datadog -- LLM Observability + Control Alerts
 
 **File:** `backend/integrations/datadog.py`
 
-**Purpose:** Dual role. (1) LLM Observability for the agent chain -- auto-instrumented via `ddtrace-run`. (2) Custom alerts when governance controls fail or breach.
+**Purpose:** Dual role. (1) LLM Observability + AI Agent Monitoring auto-instrumented via `ddtrace-run`. (2) Custom Datadog Events when control breaches occur.
 
 ### Setup
 
 ```bash
-pip install ddtrace
+pip install "ddtrace>=4.8.0"
 ```
+
+The 4.8+ requirement is critical -- it auto-instruments both `pydantic-ai>=1.63` AND `google-genai>=2.0`. Older versions (2.x, 3.x) instrument `google-genai` but miss Pydantic AI tool calls.
 
 ### Environment Variables
 
 | Var | Required | Example |
 |---|---|---|
-| `DD_API_KEY` | yes | from datadoghq.com → Organization → API Keys |
-| `DD_SITE` | yes | `datadoghq.com` (US1) or regional variant |
+| `DD_API_KEY` | yes | From Datadog → Organization → API Keys |
+| `DD_SITE` | yes | `datadoghq.com` (US1) or `us3.datadoghq.com`, etc. |
 | `DD_LLMOBS_ENABLED` | yes | `1` |
 | `DD_LLMOBS_AGENTLESS_ENABLED` | yes | `1` (no agent process needed) |
 | `DD_LLMOBS_ML_APP` | yes | `regradar` |
-| `DD_SERVICE` | yes | `regradar-backend` |
-| `DD_ENV` | yes | `hackathon` |
+| `DD_SERVICE` | no | default `regradar-backend` |
+| `DD_ENV` | no | default `hackathon` |
 
-### Auto-Instrumentation
+### Auto-instrumentation
 
-The magic happens via `ddtrace-run`:
+Everything happens via `ddtrace-run`:
 
 ```bash
 ddtrace-run uvicorn backend.main:app --reload
 ```
 
-This wraps the Python process and auto-instruments:
-- `google-genai` SDK (every Gemini call → LLM span)
-- `openai` SDK (every OpenRouter call → LLM span)
-- `clickhouse_connect` (every query → DB span)
-- `fastapi` (every route → HTTP span)
-- `httpx` and `aiohttp` (every outbound HTTP → span)
+This auto-instruments:
+- `pydantic-ai` agent runs → LLM spans tagged with agent name
+- `pydantic-ai` tool calls → child spans tagged with tool name
+- `google-genai` SDK → underlying LLM call spans
+- `clickhouse-connect` → DB spans
+- `fastapi` routes → HTTP spans
+- `httpx`/`aiohttp` → outbound spans (Nimble, Senso, Firecrawl, OpenRouter)
 
-**Result:** Open Datadog's AI Agent Console and see the full Classifier → Mapper → Analyst → Advisor chain with input/output, latencies, token counts, and inter-agent calls.
+In Datadog's AI Agent Console you see:
+- A node per Pydantic AI agent (`policy_crawler`, `impact_analysis`, `auditor`)
+- Edges showing tool calls and inter-agent handoffs
+- Per-agent latency, token cost, error rate
+- Click a trigger_id, see the full chain end-to-end
 
-### Custom Tagging Per Agent
+### Custom tagging per trigger
 
 ```python
 # backend/utils/logging.py
 from ddtrace.llmobs import LLMObs
 
-def annotate_llm_span(agent_id: str, claim_id: str | None = None):
-    """Adds custom tags to the currently-active LLM span."""
-    tags = {"agent": agent_id}
-    if claim_id:
-        tags["claim_id"] = claim_id
+def annotate_llm_span(*, agent_id: str, trigger_id: str, extra_tags: dict | None = None):
+    """Tags the active LLM Obs span. Call at top of every agent run."""
+    tags = {"agent": agent_id, "trigger_id": trigger_id}
+    if extra_tags:
+        tags.update(extra_tags)
     LLMObs.annotate(tags=tags)
 ```
 
-Called from inside each agent's `execute()`:
+Called from `backend/agents/base.py`'s `agent_run_context()` context manager.
 
-```python
-class ClassifierAgent(BaseAgent):
-    async def execute(self, blackboard):
-        annotate_llm_span(agent_id=self.agent_id,
-                          claim_id=blackboard.current_claim_id)
-        # ... rest of agent logic
-```
+### Control breach alerts (separate from LLM Obs)
 
-### Custom Alerts (for Control Failures)
-
-When The Advisor updates a control and the new test result is FAILING, fire a Datadog alert:
+When the Auditor approves an Impact Report containing a control flip to FAILING, post a Datadog Event:
 
 ```python
 # backend/integrations/datadog.py
+"""Custom Datadog Events for control breaches. Separate from LLM Obs."""
+
+import os
 from datadog import api as dd_api
 from datadog import initialize
-import os
-import structlog
 
-log = structlog.get_logger()
+from backend.utils.logging import get_logger
+
+log = get_logger(__name__)
 
 
 class DatadogAlerter:
     _initialized: bool = False
-    
+
     @classmethod
     def init(cls):
         if cls._initialized:
@@ -731,307 +776,496 @@ class DatadogAlerter:
             api_host=f"https://api.{os.environ['DD_SITE']}",
         )
         cls._initialized = True
-    
+
     @classmethod
     async def send_control_breach_alert(
         cls,
         *,
         control_id: str,
         control_name: str,
-        regulation_title: str,
-        affected_position_count: int,
-        notional_exposure_usd: float,
+        regulation_section: str,
+        affected_account_count: int,
+        affected_balance_usd: float,
         owner_team: str,
+        cited_md_url: str | None = None,
+        source: str = "event_driven",
         severity: str = "critical",
     ) -> None:
-        """Sends a Datadog event when a control breaches."""
         cls.init()
         import asyncio
+        body = (
+            f"**{control_name}** is FAILING.\n\n"
+            f"**Regulation:** {regulation_section}\n"
+            f"**Affected accounts:** {affected_account_count:,}\n"
+            f"**Balance exposure:** ${affected_balance_usd:,.2f}\n"
+            f"**Owner:** {owner_team}\n"
+            f"**Source:** {source}\n"
+        )
+        if cited_md_url:
+            body += f"\n**Grounded brief:** {cited_md_url}\n"
+
         await asyncio.to_thread(
             dd_api.Event.create,
-            title=f"[RegRadar] Control breach: {control_id}",
-            text=(
-                f"**{control_name}** is FAILING due to regulation change:\n\n"
-                f"**Regulation:** {regulation_title}\n"
-                f"**Affected positions:** {affected_position_count}\n"
-                f"**Notional exposure:** ${notional_exposure_usd:,.0f}\n"
-                f"**Owner:** {owner_team}\n\n"
-                f"See impact analysis: http://localhost:5173/controls/{control_id}"
-            ),
+            title=f"[RegRadar] {control_id} FAILING",
+            text=body,
             tags=[
                 f"control:{control_id}",
                 f"owner:{owner_team}",
                 f"severity:{severity}",
+                f"source:{source}",
                 "service:regradar",
             ],
             alert_type="error" if severity == "critical" else "warning",
         )
-        log.info("datadog.alert_sent", control_id=control_id, severity=severity)
+        log.info("datadog.control_breach_alert_sent", control_id=control_id, severity=severity)
 ```
 
-### What To Show In Demo
+### What to show in demo
 
-1. **AI Agent Console** -- live during the CFTC cascade. Judges see the agent graph rendering.
-2. **Events stream** -- the control breach alert appears within 1 second of The Advisor's update.
-3. **Trace search** -- pull up a specific trace_id and show the full chain end-to-end.
+1. **AI Agent Console** -- live during the cascade. Judges see Policy Crawler, Impact Analysis, Auditor nodes light up.
+2. **Events stream** -- the control breach alert appears within 1 second of the Auditor approving.
+3. **Trace drill-down** -- click a trigger_id, see the full chain with token counts and latencies.
 
 ---
 
-## 7. Luminai (Workflow Execution)
+## 7. Senso -- Publish to cited.md
 
-**File:** `backend/integrations/luminai.py`
+**File:** `backend/integrations/senso.py`
 
-**Purpose:** The Advisor's action arm. When an action has `workflow_execution=true`, it's dispatched to Luminai, which performs the UI-level automation (filing forms, updating GRC systems, sending notifications).
+**Purpose:** When the Auditor approves an Impact Report, generate a structured agent-native compliance brief and publish it to `cited.md/regradar/<slug>` via Senso. **This is the action that closes the Senso prize loop -- ingestion alone doesn't qualify; publishing does.**
+
+### Background
+
+[Senso](https://senso.ai) is a Y Combinator W24 company building the "context layer for AI agents." Their thesis: AI agents need a curated, version-controlled knowledge base of verified business truth. They run [cited.md](https://cited.md) -- an open, agent-native domain where experts publish structured context that agents can cite.
+
+Their prize at this hackathon (3K credits) requires using their content generation APIs to publish content to cited.md. We do exactly that: after the Auditor approves an Impact Report, we generate a grounded compliance brief and publish.
 
 ### Setup
 
-**Important:** Luminai's developer API and SDK details are not publicly documented. The team has access to Luminai's sandbox at the hackathon. Treat this integration as a stub that we'll wire up on-site with Luminai's engineers.
+No official Python SDK. We call the REST API directly via `httpx`.
 
 ### Environment Variables
 
-| Var | Required | Notes |
+| Var | Required | Default |
 |---|---|---|
-| `LUMINAI_API_KEY` | yes | provided at hackathon |
-| `LUMINAI_BASE_URL` | yes | provided at hackathon |
-| `LUMINAI_WORKSPACE_ID` | yes | our sandbox workspace |
+| `SENSO_API_KEY` | yes | From [docs.senso.ai](https://docs.senso.ai) after signup |
+| `SENSO_BASE_URL` | no | `https://apiv2.senso.ai` |
+| `SENSO_PUBLISH_NAMESPACE` | no | `regradar` (appears in `cited.md/regradar/...`) |
 
-### Interface (Stub)
+### Interface
 
 ```python
-# backend/integrations/luminai.py
-import httpx
+# backend/integrations/senso.py
+"""Senso integration: publish grounded compliance briefs to cited.md."""
+
+from __future__ import annotations
+
 import os
-import structlog
+from datetime import datetime, timezone
 from typing import Any
-from backend.data.models import LuminaiSOP, LuminaiExecutionResult
 
-log = structlog.get_logger()
+import httpx
+from pydantic import BaseModel, Field
+
+from backend.utils.logging import get_logger
+
+log = get_logger(__name__)
 
 
-class LuminaiClient:
-    _instance: "LuminaiClient | None" = None
-    
-    def __init__(self):
-        self.base_url = os.environ["LUMINAI_BASE_URL"]
-        self.api_key = os.environ["LUMINAI_API_KEY"]
-        self.workspace_id = os.environ["LUMINAI_WORKSPACE_ID"]
-        self.http = httpx.AsyncClient(
-            base_url=self.base_url,
-            headers={"Authorization": f"Bearer {self.api_key}"},
-            timeout=60.0,
+# ════════════════════════════════════════════════════════════════
+# Brief schema
+# ════════════════════════════════════════════════════════════════
+
+
+class ProvenanceMetadata(BaseModel):
+    generated_by_agent: str
+    auditor_approved: bool
+    auditor_confidence: float
+    trigger_id: str
+    source_regulation_sections: list[str]
+    generated_at: datetime
+
+
+class ComplianceBrief(BaseModel):
+    title: str
+    handle: str = Field(default_factory=lambda: os.environ.get("SENSO_PUBLISH_NAMESPACE", "regradar"))
+    slug: str
+    body_markdown: str
+    tags: list[str]
+    provenance: ProvenanceMetadata
+    related_regulation_id: str
+    affected_account_count: int
+    affected_balance_usd: float
+    suggested_remediation: list[str]
+
+
+class PublishedBrief(BaseModel):
+    senso_id: str
+    cited_md_url: str
+    published_at: datetime
+
+
+# ════════════════════════════════════════════════════════════════
+# Client
+# ════════════════════════════════════════════════════════════════
+
+
+_HTTP: httpx.AsyncClient | None = None
+
+
+def _get_http() -> httpx.AsyncClient:
+    global _HTTP
+    if _HTTP is None:
+        _HTTP = httpx.AsyncClient(
+            base_url=os.environ.get("SENSO_BASE_URL", "https://apiv2.senso.ai"),
+            headers={
+                "X-API-Key": os.environ["SENSO_API_KEY"],
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+            timeout=30.0,
         )
-        log.info("luminai.initialized")
-    
-    @classmethod
-    def get(cls) -> "LuminaiClient":
-        if cls._instance is None:
-            cls._instance = cls()
-        return cls._instance
-    
-    async def execute_sop(
-        self,
-        *,
-        sop: LuminaiSOP,
-        dry_run: bool = True,        # demo default -- sandbox only
-    ) -> LuminaiExecutionResult:
-        """
-        Execute an SOP via Luminai. In dry-run mode (demo default), Luminai
-        opens the target site and demonstrates the workflow without
-        submitting. Returns execution_id for status polling.
-        """
-        try:
-            response = await self.http.post(
-                f"/workspaces/{self.workspace_id}/workflows/execute",
-                json={
-                    "name": sop.name,
-                    "description": sop.description,
-                    "steps": sop.steps,
-                    "context": sop.context,
-                    "dry_run": dry_run,
-                },
-            )
-            response.raise_for_status()
-            data = response.json()
-            log.info("luminai.execution_started",
-                     execution_id=data["execution_id"],
-                     dry_run=dry_run)
-            return LuminaiExecutionResult(
-                execution_id=data["execution_id"],
-                status="running",
-                preview_url=data.get("preview_url"),
-            )
-        except httpx.HTTPError as e:
-            log.error("luminai.execution_failed", error=str(e))
-            raise LuminaiError(str(e)) from e
-    
-    async def get_execution_status(
-        self,
-        execution_id: str,
-    ) -> LuminaiExecutionResult:
-        """Poll execution status. Returns updated result."""
-        response = await self.http.get(
-            f"/workspaces/{self.workspace_id}/executions/{execution_id}",
-        )
-        response.raise_for_status()
-        data = response.json()
-        return LuminaiExecutionResult(**data)
+        log.info("senso.initialized", base_url=os.environ.get("SENSO_BASE_URL"))
+    return _HTTP
 
 
-class LuminaiError(Exception):
-    pass
+async def ingest_content(*, title: str, body_markdown: str, tags: list[str]) -> str:
+    """
+    POST /content/file -- ingest raw markdown content into Senso's knowledge base.
+    Returns the content_id, which is then used in /generate to publish.
+    """
+    http = _get_http()
+    files = {
+        "file": ("brief.md", body_markdown.encode("utf-8"), "text/markdown"),
+    }
+    data = {
+        "title": title,
+        "tags": ",".join(tags),
+    }
+    # /content/file uses multipart, not JSON
+    response = await http.post(
+        "/content/file",
+        files=files,
+        data=data,
+        headers={"X-API-Key": os.environ["SENSO_API_KEY"]},   # no Content-Type override
+    )
+    response.raise_for_status()
+    payload = response.json()
+    log.info("senso.ingest_success", content_id=payload["id"])
+    return payload["id"]
+
+
+async def publish_brief(brief: ComplianceBrief) -> PublishedBrief:
+    """
+    Full publish flow:
+      1. POST /content/file -- ingest the brief markdown
+      2. POST /generate -- compose the cited.md page with our brief as context
+      3. POST /publish -- ship to cited.md/<namespace>/<slug>
+    """
+    http = _get_http()
+
+    # 1. Ingest
+    content_id = await ingest_content(
+        title=brief.title,
+        body_markdown=brief.body_markdown,
+        tags=brief.tags,
+    )
+
+    # 2. Generate (Senso composes the public page from our content + their template)
+    gen_payload = {
+        "prompt": (
+            f"Compose a cited.md article for regulatory professionals. "
+            f"Use the ingested brief as the primary source. Preserve all numerical "
+            f"claims and regulatory section citations verbatim. Add a 'How to verify' "
+            f"section at the end pointing back to the source regulation URL."
+        ),
+        "source_content_ids": [content_id],
+        "destination": "cited_md",
+        "namespace": brief.handle,
+        "slug": brief.slug,
+        "tags": brief.tags,
+        "metadata": brief.provenance.model_dump(mode="json"),
+    }
+    gen_response = await http.post("/generate", json=gen_payload)
+    gen_response.raise_for_status()
+    gen_data = gen_response.json()
+    log.info("senso.generate_success", senso_id=gen_data["id"])
+
+    # 3. Publish (in apiv2 the generate step often auto-publishes; if not, call /publish)
+    if gen_data.get("status") != "published":
+        publish_response = await http.post(f"/content/{gen_data['id']}/publish")
+        publish_response.raise_for_status()
+
+    cited_md_url = f"https://cited.md/{brief.handle}/{brief.slug}"
+    log.info("senso.publish_success", cited_md_url=cited_md_url)
+    return PublishedBrief(
+        senso_id=gen_data["id"],
+        cited_md_url=cited_md_url,
+        published_at=datetime.now(timezone.utc),
+    )
+
+
+async def search_published_briefs(query: str, top_k: int = 5) -> list[dict]:
+    """
+    POST /search -- semantic search across all our published briefs.
+    Useful for the frontend's 'find similar past violations' feature.
+    """
+    http = _get_http()
+    response = await http.post(
+        "/search",
+        json={"query": query, "top_k": top_k, "namespace": os.environ.get("SENSO_PUBLISH_NAMESPACE", "regradar")},
+    )
+    response.raise_for_status()
+    return response.json()["results"]
 ```
 
-### Pydantic Models for SOPs
+### Demo wiring
 
-```python
-# In backend/data/models.py
-class LuminaiSOPStep(BaseModel):
-    step_number: int
-    action: str                            # human-readable instruction
-    target: str | None = None              # URL or app selector
-    inputs: dict[str, Any] = Field(default_factory=dict)
+1. Auditor approves an Impact Report → `safe_to_publish = true`
+2. `backend/orchestrator/publish_alert.py` calls `senso.publish_brief(brief)`
+3. The returned `cited_md_url` is stored in `published_briefs` table + included in the Datadog alert body
+4. Frontend renders the URL as a clickable link in the chat stream
 
+### Failure modes
 
-class LuminaiSOP(BaseModel):
-    name: str                              # e.g. "File SAR with FinCEN"
-    description: str                       # for Luminai's UI
-    steps: list[LuminaiSOPStep]
-    context: dict[str, Any]                # passed to steps (form data, etc.)
+| Failure | Action |
+|---|---|
+| Ingest fails (5xx) | Retry once with backoff; if still failing, log + skip publish but continue Datadog alert |
+| Generate fails | Retry once; if still failing, fall back to direct ingest-only (no public URL) |
+| Publish fails | The content is ingested + generated; mark as 'pending_publish' in published_briefs |
 
-
-class LuminaiExecutionResult(BaseModel):
-    execution_id: str
-    status: Literal["running", "succeeded", "failed", "needs_human_review"]
-    preview_url: str | None = None         # iframe URL for demo
-    completed_steps: int = 0
-    total_steps: int = 0
-    error_message: str | None = None
-```
-
-### Demo Wiring
-
-When the demo reaches the "Execute SAR filing" moment:
-
-1. Frontend calls `POST /api/actions/{action_id}/execute`
-2. Backend reads The Advisor's saved SOP from ClickHouse
-3. Backend calls `LuminaiClient.execute_sop(sop=..., dry_run=True)`
-4. Backend returns `preview_url` to frontend
-5. Frontend embeds the `preview_url` in an iframe -- judges see Luminai navigating
-6. Frontend polls `GET /api/actions/{action_id}/status` every 500ms for updates
-
-### Pre-Demo Setup
-
-The team will pre-define one SOP in Luminai's sandbox **before** the demo:
-- **Name:** "File SAR with FinCEN (sandbox demo)"
-- **Target:** `https://bsaefiling.fincen.treas.gov/` (sandboxed copy)
-- **Steps:** Pre-validated so live execution is deterministic
-
-Don't improvise live. The demo SOP is locked.
+Senso failure should NEVER block the Datadog alert. The cascade continues.
 
 ---
 
-## 8. Cross-Cutting: The Integration Contract
+## 8. x402 -- USDC Micropayments for Compliance Briefs
 
-Every integration in `backend/integrations/` MUST follow these rules:
+**File:** `backend/integrations/x402_pay.py`
+
+**Purpose:** The `/api/compliance-brief/{reg_id}` endpoint is gated by x402. Other agents pay $0.001 USDC on Base to fetch our structured compliance briefs.
+
+### Background
+
+[x402](https://x402.org) is Coinbase's HTTP-native payment protocol. It uses the long-unused HTTP 402 "Payment Required" status code to enable instant USDC payments over HTTP. Settlement happens on Base in ~200ms at sub-cent fees. As of May 2026: 169M+ transactions, $50M+ volume, used by AWS Bedrock AgentCore Payments, Cloudflare, etc.
+
+The Devpost showcase rules say: *"Monetize it with agent payment rails (x402, MPP, CDP, agentic.market)."* x402 closes that loop in 10 demo seconds.
+
+### Setup
+
+```bash
+pip install "x402>=0.4.0" "coinbase-cdp>=1.0.0"
+```
+
+### Environment Variables
+
+| Var | Required | Default / Example |
+|---|---|---|
+| `X402_FACILITATOR_URL` | no | `https://x402.org/facilitator` (Coinbase-hosted) |
+| `X402_NETWORK` | no | `base` (mainnet) or `base-sepolia` (testnet for safer demos) |
+| `X402_RECIPIENT_ADDRESS` | yes for paid mode | Our wallet to receive USDC |
+| `X402_PRICE_USDC_PER_BRIEF` | no | `0.001` ($0.001 per fetch) |
+| `CDP_API_KEY_ID` | optional | From Coinbase Developer Portal |
+| `CDP_API_KEY_SECRET` | optional | for advanced wallet ops |
+
+### Interface
+
+```python
+# backend/integrations/x402_pay.py
+"""x402 payment gate for the /compliance-brief/{reg_id} endpoint.
+
+When an external agent requests a brief, the server returns 402 with payment
+requirements. The agent signs a USDC transfer authorization and retries. The
+x402 facilitator (Coinbase) verifies + settles on Base. Server returns the brief.
+"""
+
+import os
+from decimal import Decimal
+
+from fastapi import FastAPI, Request, HTTPException
+from x402.fastapi import x402_protected, X402Config
+
+from backend.utils.logging import get_logger
+
+log = get_logger(__name__)
+
+
+def get_x402_config() -> X402Config:
+    """Build the x402 config from env vars."""
+    return X402Config(
+        facilitator_url=os.environ.get("X402_FACILITATOR_URL", "https://x402.org/facilitator"),
+        network=os.environ.get("X402_NETWORK", "base"),
+        recipient_address=os.environ.get("X402_RECIPIENT_ADDRESS", ""),
+        token_symbol="USDC",
+    )
+
+
+def brief_price_usdc() -> Decimal:
+    """Per-fetch price for /compliance-brief/{reg_id}."""
+    return Decimal(os.environ.get("X402_PRICE_USDC_PER_BRIEF", "0.001"))
+```
+
+### Route protection
+
+```python
+# backend/api/routes_brief.py
+from fastapi import APIRouter
+from x402.fastapi import x402_protected
+
+from backend.integrations.x402_pay import get_x402_config, brief_price_usdc
+from backend.data import repositories as repo
+
+router = APIRouter()
+
+
+@router.get("/api/compliance-brief/{reg_id}")
+@x402_protected(
+    price=brief_price_usdc,
+    config=get_x402_config,
+    description="One RegRadar compliance brief in structured JSON, citation-grounded.",
+)
+async def get_compliance_brief(reg_id: str):
+    """
+    Returns the latest published compliance brief for a regulation_id.
+    Gated by x402: requires $0.001 USDC payment via the X-PAYMENT header.
+
+    Flow for an unauthenticated request:
+      1. Server returns 402 Payment Required + payment requirements in X-PAYMENT-RESPONSE
+      2. Client signs USDC transfer authorization (EIP-3009)
+      3. Client retries with X-PAYMENT header containing the signed payload
+      4. x402 middleware verifies via Coinbase facilitator
+      5. On success, this route executes and returns the brief
+    """
+    brief = await repo.get_latest_published_brief(reg_id)
+    if not brief:
+        raise HTTPException(status_code=404, detail="No published brief for that regulation")
+
+    # Record the paid fetch for our internal stats
+    await repo.write_x402_fetch(
+        brief_id=brief["brief_id"],
+        amount_usdc=float(brief_price_usdc()),
+    )
+
+    return brief
+```
+
+### Demo flow (the closing 10 seconds)
+
+```bash
+# In a terminal next to the laptop, just before the close:
+curl -i https://regradar.demo/api/compliance-brief/fcra_605
+
+# Returns:
+#   HTTP/1.1 402 Payment Required
+#   X-PAYMENT-RESPONSE: {"network":"base","amount":"0.001","token":"USDC",...}
+#
+# Then with an x402-enabled client (e.g., `x402-curl`):
+x402-curl https://regradar.demo/api/compliance-brief/fcra_605
+# (Signs payment, retries, gets the brief JSON in <2 seconds)
+```
+
+The visual is: "this URL costs $0.001 to fetch" → terminal shows the payment → brief returned. The audience sees the future of agentic commerce in real time.
+
+### Demo safety: use testnet
+
+Use `X402_NETWORK=base-sepolia` (Base testnet) for the demo to avoid actual USDC outflows. The protocol behavior is identical; only the chain is different. Switch back to `base` after the hackathon.
+
+### Failure modes
+
+| Failure | Action |
+|---|---|
+| Facilitator unreachable | Return 503 + log; the brief stays gated |
+| Payment signature invalid | Return 402 with new requirements; standard x402 behavior |
+| Onchain confirmation delayed | x402 middleware handles polling; if >10s, return 504 |
+
+---
+
+## 9. Cross-Cutting: The Integration Contract
+
+Every file in `backend/integrations/` MUST follow these rules.
 
 ### Rule 1: Singleton + Lazy Init
 
-```python
-class XxxClient:
-    _instance: "XxxClient | None" = None
-    
-    @classmethod
-    def get(cls) -> "XxxClient":
-        if cls._instance is None:
-            cls._instance = cls()
-        return cls._instance
-```
+Module-level `_CLIENT` variable, getter function builds it on first call.
 
 ### Rule 2: Structured Logging
 
 Every external call logs success and failure with structured fields:
 
 ```python
-log.info("xxx.action_success", **relevant_fields)
-log.error("xxx.action_failure", error=str(e), **relevant_fields)
+log.info("service.action_success", **relevant_fields)
+log.error("service.action_failure", error=str(e), **relevant_fields)
 ```
 
-Field names use `<service>.<action>` namespacing (e.g. `nimble.scrape_success`).
+Field namespace: `<service>.<action>` (e.g., `nimble.scrape_success`, `senso.publish_success`).
 
-### Rule 3: Custom Exception Type
-
-Each integration defines its own exception:
+### Rule 3: Custom Exception Per Integration
 
 ```python
 class NimbleError(Exception): pass
-class LuminaiError(Exception): pass
-class VertexAIError(Exception): pass
-# etc.
+class SensoError(Exception): pass
+class X402Error(Exception): pass
 ```
 
-These let upstream code decide which integration's failure triggers which fallback.
+Upstream code uses the exception type to decide fallback path.
 
 ### Rule 4: Async-First
 
-All public methods are `async def`. If the underlying SDK is sync (like `nimble-python`), wrap with `asyncio.to_thread()`. Never block the event loop.
+All public methods are `async def`. Sync SDKs (Nimble, Firecrawl, ClickHouse-connect sync mode) get wrapped with `asyncio.to_thread()`.
 
 ### Rule 5: Pydantic Returns
 
-Integrations return Pydantic models, not raw dicts. See `backend/data/models.py` for the catalog.
+Integrations return Pydantic models, not raw dicts. See each integration's own model definitions.
 
 ### Rule 6: Env Var Validation
 
-All required env vars are validated at startup via `backend/utils/env.py`. If a required var is missing, the app refuses to start. This prevents silent failures during demo.
+All required env vars are listed in `backend/utils/env.py::REQUIRED_VARS`. App refuses to start if any is missing.
 
 ### Rule 7: No Auth Logic Here
 
-Auth tokens come from env vars only. No OAuth flows, no token refresh logic. (Production TODO.)
+Auth tokens come from env vars. No OAuth refresh, no token rotation. (Production TODO.)
 
 ### Rule 8: Timeouts
 
-Every external HTTP call has an explicit timeout:
 - LLM calls: 30s
 - Scraping: 60s
 - ClickHouse queries: 10s
-- Luminai workflows: no timeout (long-running)
-- Datadog: 5s
+- Senso ingest/generate: 30s
+- Senso search: 5s
+- x402 verify: 10s
+- Datadog event POST: 5s
 
-### Rule 9: Retry Policy
+### Rule 9: Retry With Tenacity
 
-Use `tenacity` for retries. Three retries with exponential backoff (1s, 2s, 4s) before falling back or raising:
+Three retries with exponential backoff (1s, 2s, 4s) before falling back or raising:
 
 ```python
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=1, max=4),
-)
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=4))
 async def call_with_retry():
     ...
 ```
 
-### Rule 10: Tests Live Alongside
+### Rule 10: Pre-warm at Startup
 
-Each `xxx.py` in `backend/integrations/` has a corresponding `tests/test_xxx.py` with at minimum:
-- `test_singleton_returns_same_instance`
-- `test_missing_env_var_raises_at_startup`
-- `test_basic_call_returns_expected_shape`
-
-Mock external services with `respx` (for httpx) or fixture JSON files.
+Every singleton's `_get_client()` is called once from `backend/main.py::lifespan` so the first user request doesn't pay the init cost.
 
 ---
 
 ## AI Tool Hints
 
-If you're an AI coding tool building this:
+If you're an AI tool building these:
 
-1. **Implement integrations in this order:** ClickHouse → Vertex AI → Nimble → Firecrawl → Datadog → OpenRouter → Luminai. Each builds on the previous.
+1. **Implement in this order:** ClickHouse → Vertex AI → Nimble → Firecrawl → Datadog → Senso → x402 → OpenRouter. Each builds on the previous.
 
-2. **Write `backend/data/models.py` first.** All integration return types reference it. See `docs/AGENTS.md` for the agent-related models and this file for the integration-related ones.
+2. **Write `backend/data/models.py` first.** All integration return types reference Pydantic models defined there.
 
-3. **Don't invent new patterns.** Copy the singleton + lazy-init pattern verbatim. Use the same logging field names. Use the same exception hierarchy.
+3. **Don't invent new patterns.** Copy the singleton + lazy-init pattern verbatim from `vertex_ai.py`. Copy logging field conventions verbatim.
 
-4. **Test the failover paths.** Have a test that forces Nimble to fail and verifies Firecrawl picks up the same URL. Have a test that forces Vertex AI to 429 and verifies OpenRouter picks up.
+4. **Test failover paths.** Have a test that forces Nimble to raise NimbleError and verifies Firecrawl picks up the same URL with the same return type.
 
-5. **Pre-warm before demo.** All singletons should be initialized at app startup, not on first request. Add an `init_integrations()` function called from `lifespan` in `backend/main.py`.
+5. **Use base-sepolia for x402 during development.** Switch to base mainnet only just before the demo (and back to sepolia immediately after).
+
+6. **Pre-warm Senso ingest on startup.** Senso's first-request latency is ~3s due to cold start. Make a dummy `/search` call in `lifespan` to warm it.
+
+7. **For Datadog auto-instrumentation to work,** the entry point MUST be `ddtrace-run uvicorn ...`. Not `python -m uvicorn ...` -- that bypasses ddtrace.

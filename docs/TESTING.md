@@ -2,20 +2,7 @@
 
 How to verify everything works -- before the demo, during the demo, and what to do if it doesn't.
 
-This file is meant to be read TWICE. Once during dev to write the tests. Once at T-24 hours to verify nothing's broken.
-
----
-
-## Table of Contents
-
-1. [Philosophy](#1-philosophy)
-2. [Smoke Tests](#2-smoke-tests)
-3. [Unit Tests](#3-unit-tests)
-4. [Integration Tests](#4-integration-tests)
-5. [End-to-End Demo Test](#5-end-to-end-demo-test)
-6. [Pre-Demo Run-Through](#6-pre-demo-run-through)
-7. [Failure Recovery Procedures](#7-failure-recovery-procedures)
-8. [Pre-Recorded Backup Videos](#8-pre-recorded-backup-videos)
+This file is read TWICE. Once during dev to write the tests. Once at T-24 hours to verify nothing's broken.
 
 ---
 
@@ -23,19 +10,18 @@ This file is meant to be read TWICE. Once during dev to write the tests. Once at
 
 For hackathon scope, we prioritize:
 
-1. **Smoke tests** that confirm every integration works -- run before every demo attempt
-2. **End-to-end demo test** that runs the full CFTC cascade -- run 3+ times before pitch
-3. **Failure recovery procedures** rehearsed so we don't panic on stage
+1. **Smoke tests** confirming every integration works -- run before every demo attempt
+2. **End-to-end demo test** running the full schema_enrichment_fcra cascade -- run 3+ times before pitch
+3. **Failure recovery rehearsed** so we don't panic on stage
 
 We do NOT prioritize:
-
 - Code coverage targets
 - Property-based testing
-- Load testing (we're demoing one trigger, not 10,000 RPS)
+- Load testing
 - Mutation testing
 - Snapshot testing of UI
 
-If a test isn't directly testing "will this work on stage tomorrow," skip it for now.
+If a test isn't directly testing "will this work on stage tomorrow," skip it.
 
 ---
 
@@ -43,29 +29,25 @@ If a test isn't directly testing "will this work on stage tomorrow," skip it for
 
 `scripts/smoke_test.py` is the source of truth for "is everything working." Run it before EVERY demo attempt.
 
-### Smoke Test Coverage
-
 ```python
 # scripts/smoke_test.py
 """
-Verifies every integration works.
-Exits 0 on success, 1 on first failure.
+Smoke-test every integration and seed-data invariant.
 Run after setup, before demo, and before any push to main.
 """
+
 import asyncio
 import sys
-import structlog
 from rich.console import Console
 from rich.table import Table
 
-log = structlog.get_logger()
 console = Console()
 
 
 async def smoke_test():
     results = []
-    
-    # 1. Env vars
+
+    # 1. Env vars validated
     try:
         from backend.utils import env
         env.validate()
@@ -73,128 +55,185 @@ async def smoke_test():
     except Exception as e:
         results.append(("Env vars validated", False, str(e)))
         return _report(results)
-    
-    # 2. ClickHouse connection
+
+    # 2. ClickHouse + version >= 25.8
     try:
-        from backend.integrations.clickhouse_client import ClickHouseClient
-        client = ClickHouseClient.get_sync()
-        version = client.query("SELECT version()").result_rows[0][0]
-        results.append(("ClickHouse connected", True, f"v{version}"))
+        from backend.integrations.clickhouse_client import get_client
+        client = await get_client()
+        version = (await client.query("SELECT version()")).result_rows[0][0]
+        major = int(version.split(".")[0])
+        minor = int(version.split(".")[1])
+        ok = (major, minor) >= (25, 8)
+        results.append(("ClickHouse >= 25.8", ok, f"v{version}"))
     except Exception as e:
-        results.append(("ClickHouse connected", False, str(e)))
-    
-    # 3. Seed data loaded
+        results.append(("ClickHouse >= 25.8", False, str(e)))
+
+    # 3. Seed data loaded with expected distributions
     try:
-        client = ClickHouseClient.get_sync()
-        kg_count = client.query("SELECT COUNT(*) FROM kg_nodes").result_rows[0][0]
-        reg_count = client.query("SELECT COUNT(*) FROM reg_versions").result_rows[0][0]
-        deriv_count = client.query("SELECT COUNT(*) FROM derivatives_portfolio").result_rows[0][0]
-        ctrl_count = client.query("SELECT COUNT(*) FROM controls").result_rows[0][0]
-        assert kg_count >= 100, f"Expected >=100 kg_nodes, got {kg_count}"
-        assert reg_count >= 20, f"Expected >=20 regs, got {reg_count}"
-        assert deriv_count >= 3000, f"Expected >=3000 derivatives, got {deriv_count}"
-        assert ctrl_count >= 8, f"Expected >=8 controls, got {ctrl_count}"
-        results.append(("Seed data loaded", True,
-                        f"{kg_count} KG, {reg_count} regs, {deriv_count} derivs, {ctrl_count} ctrls"))
-    except Exception as e:
-        results.append(("Seed data loaded", False, str(e)))
-    
-    # 4. Vertex AI / Gemini works
-    try:
-        from backend.integrations.vertex_ai import VertexAIClient
-        client = VertexAIClient.get()
-        response = await client.generate(
-            model="gemini-3.5-flash",
-            prompt="Reply with exactly the word OK and nothing else.",
-            max_output_tokens=10,
-            agent_id="smoke_test",
+        client = await get_client()
+        accounts = (await client.query("SELECT count() FROM credit_card_accounts")).result_rows[0][0]
+        controls = (await client.query("SELECT count() FROM controls")).result_rows[0][0]
+        regs = (await client.query("SELECT count() FROM reg_versions")).result_rows[0][0]
+        conds = (await client.query("SELECT count() FROM compliance_conditions")).result_rows[0][0]
+        embeddings = (await client.query("SELECT count() FROM policy_embeddings")).result_rows[0][0]
+        ok = (
+            accounts >= 50000
+            and controls == 6
+            and regs == 2
+            and conds >= 6
+            and embeddings == 4
         )
-        assert "OK" in response, f"Unexpected response: {response}"
-        results.append(("Gemini 3.5 Flash works", True, None))
+        detail = f"{accounts} acct, {controls} ctrl, {regs} reg, {conds} cond, {embeddings} emb"
+        results.append(("Seed data correct", ok, detail))
     except Exception as e:
-        results.append(("Gemini 3.5 Flash works", False, str(e)))
-    
-    # 5. Gemini 3.1 Pro works
+        results.append(("Seed data correct", False, str(e)))
+
+    # 4. Expected breach distributions match seed tuning
     try:
-        from backend.integrations.vertex_ai import VertexAIClient
-        client = VertexAIClient.get()
-        response = await client.generate(
+        client = await get_client()
+        bureau_mismatch = (
+            await client.query("SELECT count() FROM credit_card_accounts WHERE bureau_reported = true AND bureau_reported_status != payment_status")
+        ).result_rows[0][0]
+        active_disputes = (
+            await client.query("SELECT count() FROM credit_card_accounts WHERE dispute_filed = true")
+        ).result_rows[0][0]
+        # Allow +/- 20% drift from tuning targets
+        ok = 1200 <= bureau_mismatch <= 1800 and 320 <= active_disputes <= 480
+        results.append((
+            "Seed distributions in range",
+            ok,
+            f"bureau_mismatch={bureau_mismatch} (target ~1500), disputes={active_disputes} (target ~400)"
+        ))
+    except Exception as e:
+        results.append(("Seed distributions in range", False, str(e)))
+
+    # 5. Vertex AI Gemini 3.5 Flash works
+    try:
+        from backend.integrations.vertex_ai import _get_genai_client
+        client = _get_genai_client()
+        r = await client.aio.models.generate_content(
+            model="gemini-3.5-flash",
+            contents="Reply with exactly the word OK.",
+        )
+        ok = "OK" in r.text
+        results.append(("Gemini 3.5 Flash", ok, None))
+    except Exception as e:
+        results.append(("Gemini 3.5 Flash", False, str(e)))
+
+    # 6. Vertex AI Gemini 3.1 Pro works
+    try:
+        from backend.integrations.vertex_ai import _get_genai_client
+        client = _get_genai_client()
+        r = await client.aio.models.generate_content(
             model="gemini-3.1-pro",
-            prompt="Reply with exactly the word OK and nothing else.",
-            max_output_tokens=10,
-            agent_id="smoke_test",
+            contents="Reply with exactly the word OK.",
         )
-        assert "OK" in response
-        results.append(("Gemini 3.1 Pro works", True, None))
+        ok = "OK" in r.text
+        results.append(("Gemini 3.1 Pro", ok, None))
     except Exception as e:
-        results.append(("Gemini 3.1 Pro works", False, str(e)))
-    
-    # 6. OpenRouter fallback works
+        results.append(("Gemini 3.1 Pro", False, str(e)))
+
+    # 7. gemini-embedding-001 works at output_dim=768
     try:
-        from backend.integrations.openrouter import OpenRouterClient
-        client = OpenRouterClient.get()
-        response = await client.generate(
-            model="gemini-3.5-flash",
-            prompt="Reply with exactly the word OK.",
-            max_output_tokens=10,
-            agent_id="smoke_test",
+        from backend.integrations.vertex_ai import embed_text
+        vec = await embed_text(text="The quick brown fox", output_dim=768)
+        ok = len(vec) == 768
+        results.append(("gemini-embedding-001 (768d)", ok, f"len={len(vec)}"))
+    except Exception as e:
+        results.append(("gemini-embedding-001 (768d)", False, str(e)))
+
+    # 8. Pydantic AI Vertex provider builds
+    try:
+        from backend.integrations.vertex_ai import vertex_model
+        m = vertex_model("gemini-3.5-flash")
+        ok = m is not None
+        results.append(("Pydantic AI Vertex provider", ok, type(m).__name__))
+    except Exception as e:
+        results.append(("Pydantic AI Vertex provider", False, str(e)))
+
+    # 9. Check Grounding API works
+    try:
+        from backend.integrations.vertex_ai import check_grounding
+        result = await check_grounding(
+            claim="Section 605 limits stale data reporting to 7 years.",
+            sources=[
+                "Except as authorized under subsection (b), no consumer reporting agency may make any consumer report containing accounts placed for collection or charged to profit and loss which antedate the report by more than seven years."
+            ],
         )
-        assert "OK" in response
-        results.append(("OpenRouter fallback works", True, None))
+        ok = result.is_grounded and result.overall_confidence > 0.7
+        results.append(("Check Grounding", ok, f"confidence={result.overall_confidence:.2f}"))
     except Exception as e:
-        results.append(("OpenRouter fallback works", False, str(e)))
-    
-    # 7. Nimble works
+        results.append(("Check Grounding", False, str(e)))
+
+    # 10. Nimble search works
     try:
-        from backend.integrations.nimble import NimbleClient
-        client = NimbleClient.get()
-        result = await client.search(query="SEC press release", num_results=2)
-        assert len(result) > 0
-        results.append(("Nimble search works", True, f"{len(result)} results"))
+        from backend.integrations.nimble import search
+        results_nimble = await search(query="CFPB credit card rule 2026", num_results=2)
+        ok = len(results_nimble) >= 1
+        results.append(("Nimble Web Search Agents", ok, f"{len(results_nimble)} results"))
     except Exception as e:
-        results.append(("Nimble search works", False, str(e)))
-    
-    # 8. Firecrawl fallback works
+        results.append(("Nimble Web Search Agents", False, str(e)))
+
+    # 11. Firecrawl fallback works
     try:
-        from backend.integrations.firecrawl import FirecrawlClient
-        client = FirecrawlClient.get()
-        doc = await client.scrape_url("https://example.com")
-        assert len(doc.content) > 0
-        results.append(("Firecrawl fallback works", True, None))
+        from backend.integrations.firecrawl import scrape_url
+        doc = await scrape_url("https://example.com")
+        ok = len(doc.content_markdown) > 0
+        results.append(("Firecrawl fallback", ok, None))
     except Exception as e:
-        results.append(("Firecrawl fallback works", False, str(e)))
-    
-    # 9. Datadog ingest works (best-effort -- can't really verify without UI check)
+        results.append(("Firecrawl fallback", False, str(e)))
+
+    # 12. Senso publish (smoke -- does NOT publish, just verifies ingest works)
+    try:
+        from backend.integrations.senso import ingest_content
+        content_id = await ingest_content(
+            title="Smoke Test (ignore)",
+            body_markdown="This is a smoke test. Please ignore.",
+            tags=["smoke_test"],
+        )
+        ok = content_id is not None
+        results.append(("Senso ingest", ok, f"id={content_id}"))
+    except Exception as e:
+        results.append(("Senso ingest", False, str(e)))
+
+    # 13. Datadog event ingest works
     try:
         from backend.integrations.datadog import DatadogAlerter
-        DatadogAlerter.init()
         await DatadogAlerter.send_control_breach_alert(
             control_id="CTRL-SMOKE-TEST",
             control_name="Smoke Test (ignore)",
-            regulation_title="Smoke test",
-            affected_position_count=0,
-            notional_exposure_usd=0,
+            regulation_section="N/A",
+            affected_account_count=0,
+            affected_balance_usd=0,
             owner_team="dev",
             severity="info",
         )
-        results.append(("Datadog ingest works", True, "check Datadog UI for event"))
+        results.append(("Datadog event ingest", True, "check Datadog UI for event"))
     except Exception as e:
-        results.append(("Datadog ingest works", False, str(e)))
-    
-    # 10. Luminai (skip if no creds yet)
+        results.append(("Datadog event ingest", False, str(e)))
+
+    # 14. x402 facilitator reachable
     try:
-        from backend.utils import env
-        if not env.get("LUMINAI_API_KEY", default=""):
-            results.append(("Luminai (skipped -- no creds)", True, "fill in at hackathon"))
-        else:
-            from backend.integrations.luminai import LuminaiClient
-            client = LuminaiClient.get()
-            # Just check we can hit the base URL
-            response = await client.http.get("/health")
-            results.append(("Luminai reachable", True, None))
+        import httpx
+        import os
+        r = await httpx.AsyncClient().get(
+            os.environ.get("X402_FACILITATOR_URL", "https://x402.org/facilitator") + "/health",
+            timeout=10,
+        )
+        ok = r.status_code == 200
+        results.append(("x402 facilitator reachable", ok, f"status={r.status_code}"))
     except Exception as e:
-        results.append(("Luminai reachable", False, str(e)))
-    
+        results.append(("x402 facilitator reachable", False, str(e)))
+
+    # 15. ClickHouse HNSW index exists on policy_embeddings
+    try:
+        client = await get_client()
+        rows = (await client.query("SELECT count() FROM system.data_skipping_indices WHERE table = 'policy_embeddings' AND type LIKE '%vector_similarity%'")).result_rows
+        ok = rows[0][0] >= 1
+        results.append(("ClickHouse HNSW index on policy_embeddings", ok, None))
+    except Exception as e:
+        results.append(("ClickHouse HNSW index on policy_embeddings", False, str(e)))
+
     return _report(results)
 
 
@@ -203,24 +242,20 @@ def _report(results):
     table.add_column("Check", style="cyan")
     table.add_column("Status", justify="center")
     table.add_column("Detail", style="dim")
-    
+
     all_passed = True
     for check, passed, detail in results:
-        if passed:
-            status = "[green]✓ PASS[/green]"
-        else:
-            status = "[red]✗ FAIL[/red]"
+        status = "[green]✓ PASS[/green]" if passed else "[red]✗ FAIL[/red]"
+        if not passed:
             all_passed = False
         table.add_row(check, status, detail or "")
-    
+
     console.print(table)
-    
     if all_passed:
         console.print("\n[bold green]All checks passed. Ready to demo.[/bold green]")
         return 0
-    else:
-        console.print("\n[bold red]Some checks failed. Fix before continuing.[/bold red]")
-        return 1
+    console.print("\n[bold red]Some checks failed. Fix before continuing.[/bold red]")
+    return 1
 
 
 if __name__ == "__main__":
@@ -228,399 +263,283 @@ if __name__ == "__main__":
     sys.exit(code)
 ```
 
-### Running Smoke Tests
-
-```bash
-# Default run
-python scripts/smoke_test.py
-
-# Verbose with full stack traces
-python scripts/smoke_test.py --verbose
-
-# Only check seed data
-python scripts/smoke_test.py --check-seed
-```
-
 ### When To Run
 
-- After initial setup (`./scripts/setup.sh` calls this at the end)
+- After initial setup
 - After any `.env` change
 - At T-2 hours before demo
-- After every git pull
+- After every `git pull`
 - Whenever something feels wrong
 
 ---
 
 ## 3. Unit Tests
 
-Unit tests live in `tests/` mirroring the `backend/` structure. Use `pytest` with `pytest-asyncio`.
-
-### Required Unit Tests
-
 For hackathon scope, write unit tests ONLY for these high-risk modules:
 
 | Module | Why | Test File |
 |---|---|---|
-| `backend/orchestrator/blackboard.py` | Concurrency bugs are devastating | `tests/test_blackboard.py` |
-| `backend/orchestrator/ordering.py` | Dependency resolution is subtle | `tests/test_ordering.py` |
-| `backend/agents/base.py` | All agents inherit -- bugs propagate | `tests/test_base_agent.py` |
 | `backend/data/repositories.py` | Wrong query = wrong demo | `tests/test_repositories.py` |
 | `backend/utils/env.py` | Validation must be strict | `tests/test_env.py` |
+| `backend/agents/auditor.py` | Critical -- this is what blocks hallucinations | `tests/test_auditor.py` |
 
-Skip unit tests for everything else. Integration tests + smoke tests cover them.
+Skip unit tests for everything else. Integration + smoke tests cover them.
 
-### Example: Blackboard Test
+### Example: Auditor blocks fabrication
 
 ```python
-# tests/test_blackboard.py
+# tests/test_auditor.py
 import pytest
-from backend.orchestrator.blackboard import Blackboard, AgentClaim
+from backend.agents.auditor import run_auditor
+from backend.data.models import ImpactReport, ControlUpdate
 
 
 @pytest.mark.asyncio
-async def test_blackboard_collects_claims():
-    bb = Blackboard(trigger_id="test_001")
-    bb.add_claim(AgentClaim(
-        agent_id="classifier",
-        relevance_score=0.92,
-        response_type="primary",
-        depends_on=[],
-        reasoning="test",
-    ))
-    bb.add_claim(AgentClaim(
-        agent_id="mapper",
-        relevance_score=0.88,
-        response_type="primary",
-        depends_on=["classifier"],
-        reasoning="test",
-    ))
-    
-    claims = bb.get_claims()
-    assert len(claims) == 2
-    assert claims[0].agent_id == "classifier"
+async def test_auditor_blocks_fabricated_dollar_amount():
+    """The Auditor must reject an ImpactReport claiming a wrong fine amount."""
+    fabricated = ImpactReport(
+        trigger_id="test_fabrication",
+        affected_controls=[],
+        classifications={},
+        sample_account_ids=[],
+        total_breach_count=1247,
+        total_at_risk_count=0,
+        total_balance_at_risk_usd=1_975_000,
+        citations=["FCRA Section 605"],
+        suggested_remediation=["Citi was fined $2,500,000 for this exact violation."],   # fabricated!
+        reasoning="...",
+    )
+    verdict = await run_auditor(fabricated)
+    assert verdict.verdict == "rejected"
+    assert any("2,500,000" in r or "$2.5M" in r for r in verdict.rejection_reasons)
+    assert verdict.safe_to_publish is False
 
 
 @pytest.mark.asyncio
-async def test_blackboard_caps_at_max_per_message(monkeypatch):
-    monkeypatch.setenv("AGENT_MAX_PER_MESSAGE", "3")
-    bb = Blackboard(trigger_id="test_002")
-    for i in range(5):
-        bb.add_claim(AgentClaim(
-            agent_id=f"agent_{i}",
-            relevance_score=0.9 - i * 0.05,
-            response_type="primary",
-            depends_on=[],
-            reasoning="test",
-        ))
-    
-    final = bb.resolve_claims()
-    assert len(final) == 3                       # capped at 3
-    assert final[0].agent_id == "agent_0"        # highest relevance kept
-```
-
-### Example: Ordering Test
-
-```python
-# tests/test_ordering.py
-from backend.orchestrator.ordering import topological_sort
-from backend.orchestrator.blackboard import AgentClaim
-
-
-def test_topological_sort_respects_dependencies():
-    claims = [
-        AgentClaim(agent_id="advisor", relevance_score=0.8, response_type="supporting",
-                   depends_on=["analyst"], reasoning=""),
-        AgentClaim(agent_id="analyst", relevance_score=0.85, response_type="supporting",
-                   depends_on=["mapper"], reasoning=""),
-        AgentClaim(agent_id="mapper", relevance_score=0.9, response_type="primary",
-                   depends_on=["classifier"], reasoning=""),
-        AgentClaim(agent_id="classifier", relevance_score=0.95, response_type="primary",
-                   depends_on=[], reasoning=""),
-    ]
-    sorted_claims = topological_sort(claims)
-    order = [c.agent_id for c in sorted_claims]
-    assert order == ["classifier", "mapper", "analyst", "advisor"]
-
-
-def test_topological_sort_handles_cycle():
-    """Dependency cycles should raise."""
-    import pytest
-    claims = [
-        AgentClaim(agent_id="a", depends_on=["b"], relevance_score=0.8,
-                   response_type="primary", reasoning=""),
-        AgentClaim(agent_id="b", depends_on=["a"], relevance_score=0.8,
-                   response_type="primary", reasoning=""),
-    ]
-    with pytest.raises(ValueError, match="cycle"):
-        topological_sort(claims)
-```
-
-### Running Unit Tests
-
-```bash
-# All unit tests
-pytest tests/ -v
-
-# Just one file
-pytest tests/test_blackboard.py -v
-
-# With coverage
-pytest tests/ --cov=backend --cov-report=term-missing
+async def test_auditor_approves_grounded_claim():
+    """The Auditor must approve a claim that's actually in the source regulation."""
+    grounded = ImpactReport(
+        trigger_id="test_grounded",
+        affected_controls=[
+            ControlUpdate(
+                control_id="CTRL-FCRA-STALE-DATA",
+                new_status="FAILING",
+                affected_account_count=1247,
+                affected_balance_usd=1_975_000,
+                rationale="Section 605 prohibits reporting accounts more than 7 years old.",
+                related_regulation_section="15 USC 1681c (FCRA Section 605)",
+            )
+        ],
+        classifications={},
+        sample_account_ids=["acct_001", "acct_002"],
+        total_breach_count=1247,
+        total_at_risk_count=0,
+        total_balance_at_risk_usd=1_975_000,
+        citations=["15 USC 1681c (FCRA Section 605)"],
+        suggested_remediation=["Stop reporting accounts with original_delinquency_date > 7 years."],
+        reasoning="Each of 1,247 accounts has original_delinquency_date > 7 years and bureau_reported = true.",
+    )
+    verdict = await run_auditor(grounded)
+    assert verdict.verdict in ("approved", "approved_with_warnings")
+    assert verdict.overall_confidence >= 0.65
+    assert verdict.safe_to_publish is True
 ```
 
 ---
 
 ## 4. Integration Tests
 
-Integration tests verify multi-component behavior. Live in `tests/integration/`.
-
-### Required Integration Tests
-
 | Test | What It Verifies | File |
 |---|---|---|
-| `test_cftc_cascade` | Full CFTC demo arc end-to-end | `tests/integration/test_cftc_cascade.py` |
+| `test_schema_enrichment_cascade` | Full headline demo arc end-to-end | `tests/integration/test_schema_enrichment.py` |
+| `test_dispute_filed_cross_trigger` | TILA + FCRA fire in parallel from one event | `tests/integration/test_dispute_cross.py` |
 | `test_nimble_failover_to_firecrawl` | When Nimble fails, Firecrawl picks up | `tests/integration/test_scraping_failover.py` |
-| `test_gemini_failover_to_openrouter` | When Vertex AI fails, OpenRouter picks up | `tests/integration/test_llm_failover.py` |
-| `test_auditor_rejects_fabrication` | Auditor blocks hallucinated citations | `tests/integration/test_auditor.py` |
-| `test_control_breach_triggers_datadog_alert` | Advisor → Datadog wiring | `tests/integration/test_control_alerting.py` |
-| `test_proactive_trigger_fires_cascade` | Watcher → blackboard → agents | `tests/integration/test_proactive.py` |
+| `test_gemini_failover_to_openrouter` | When Vertex AI 429s, OpenRouter picks up | `tests/integration/test_llm_failover.py` |
+| `test_senso_publish_loop` | Auditor approves → Senso publishes → URL returned | `tests/integration/test_senso_publish.py` |
+| `test_control_breach_to_datadog` | Auditor approves → Datadog alert fires | `tests/integration/test_control_alerting.py` |
+| `test_x402_402_then_200` | Compliance brief returns 402, then 200 after payment | `tests/integration/test_x402.py` |
+| `test_monitoring_sweep_zero_llm` | Monitoring agent calls zero LLM tokens during sweep | `tests/integration/test_monitoring_zero_llm.py` |
 
-### Example: CFTC Cascade Test
+### Example: Schema Enrichment Cascade
 
 ```python
-# tests/integration/test_cftc_cascade.py
+# tests/integration/test_schema_enrichment.py
 import pytest
-import asyncio
-from backend.orchestrator.blackboard import Blackboard
-from backend.agents import (
-    ClassifierAgent, MapperAgent, AnalystAgent, AdvisorAgent, AuditorAgent
-)
-from backend.data.models import RegulationEvent
+import httpx
 
 
 @pytest.mark.asyncio
 @pytest.mark.integration
-async def test_cftc_cascade_completes_in_under_15s():
-    """The showcase demo must complete in < 15 seconds end-to-end."""
-    # Setup -- a fake CFTC margin amendment event
-    event = RegulationEvent(
-        reg_id="cftc_margin_amend_2026",
-        title="Final Rule: Initial Margin Requirements for Uncleared Swaps",
-        content="...effective date 2026-07-21...threshold increased from 6% to 8%...",
-        source_url="https://cftc.gov/PressRoom/PressReleases/example",
-        regulator="CFTC",
-    )
-    
-    bb = Blackboard(trigger_id="test_cftc_cascade")
-    bb.set_regulation_event(event)
-    
-    agents = [
-        ClassifierAgent(),
-        MapperAgent(),
-        AnalystAgent(),
-        AdvisorAgent(),
-        AuditorAgent(),
-    ]
-    
-    start = asyncio.get_event_loop().time()
-    
-    # Phase 1: All agents score relevance in parallel
-    scores = await asyncio.gather(*[
-        agent.score_relevance(bb) for agent in agents
-    ])
-    for agent, score in zip(agents, scores):
-        claim = agent.classify_claim_type(score, bb)
-        if claim:
-            bb.add_claim(claim)
-    
-    # Phase 2: Resolve order
-    resolved = bb.resolve_claims()
-    
-    # Phase 3: Execute in order, respecting dependencies
-    for claim in resolved:
-        agent = next(a for a in agents if a.agent_id == claim.agent_id)
-        await agent.execute(bb)
-    
-    elapsed = asyncio.get_event_loop().time() - start
-    
-    assert elapsed < 15.0, f"Cascade took {elapsed:.1f}s, must be < 15s"
-    
-    # Verify outputs
-    classifier_output = bb.get_agent_output("classifier")
-    assert classifier_output.severity == "HIGH"
-    
-    mapper_output = bb.get_agent_output("mapper")
-    assert mapper_output.portfolio_scan.affected_positions > 800
-    
-    analyst_output = bb.get_agent_output("analyst")
-    assert analyst_output.position_classification.BREACH > 0
-    
-    advisor_output = bb.get_agent_output("advisor")
-    assert any(c.control_id == "CTRL-001" for c in advisor_output.control_updates)
-    
-    auditor_output = bb.get_agent_output("auditor")
-    assert auditor_output.verdict == "approved"
+async def test_schema_enrichment_completes_in_under_10s():
+    """The headline demo cascade must finish in <10s end-to-end."""
+    import time
+
+    async with httpx.AsyncClient(base_url="http://localhost:8000", timeout=30) as http:
+        # Fire trigger
+        r = await http.post("/api/internal/scenarios/schema_enrichment_fcra")
+        assert r.status_code == 200
+        trigger_id = r.json()["data"]["trigger_id"]
+
+        # Poll for completion
+        start = time.time()
+        for _ in range(60):
+            r = await http.get(f"/api/triggers/{trigger_id}")
+            data = r.json()["data"]
+            if data.get("auditor_verdict") and data.get("published_brief"):
+                break
+            await asyncio.sleep(0.2)
+        elapsed = time.time() - start
+
+        assert elapsed < 10.0, f"Cascade took {elapsed:.1f}s, must be < 10s"
+
+        # Verify each stage
+        assert data["impact_report"]["total_breach_count"] > 1000           # ~1247
+        assert data["impact_report"]["total_balance_at_risk_usd"] > 0
+        assert "CTRL-FCRA-STALE-DATA" in [c["control_id"] for c in data["impact_report"]["affected_controls"]]
+
+        assert data["auditor_verdict"]["verdict"] in ("approved", "approved_with_warnings")
+        assert data["auditor_verdict"]["overall_confidence"] >= 0.7
+
+        assert data["published_brief"]["cited_md_url"].startswith("https://cited.md/regradar/")
+
+        assert len(data["dd_alerts"]) >= 1
+        assert data["dd_alerts"][0]["control_id"] == "CTRL-FCRA-STALE-DATA"
 ```
 
-### Running Integration Tests
+Run with:
 
 ```bash
-# All integration tests (requires real services)
-pytest tests/integration/ -v --integration
-
-# Skip integration tests in regular runs
-pytest tests/ -v -m "not integration"
+pytest tests/integration/ -v -m integration
 ```
-
-Mark integration tests with `@pytest.mark.integration` so they can be opted into.
 
 ---
 
 ## 5. End-to-End Demo Test
 
-`scripts/demo_e2e_test.py` is the closest thing to "rehearse the demo." It runs the full sequence the demo will run, with the same triggers, and validates each step.
+`scripts/demo_e2e_test.py` runs the same flow the demo will run. Use this 3+ times the day before.
 
 ```python
 # scripts/demo_e2e_test.py
 """
-Runs the full demo sequence non-interactively.
-Validates each agent fires, each output is correct, and total time is reasonable.
-Run this 3+ times the day before the demo.
+Execute the full demo arc non-interactively.
+Run 3+ times the day before. Once at T-30 minutes (with --quiet).
 """
+
 import asyncio
-import httpx
 import time
+import httpx
 from rich.console import Console
 
 console = Console()
-BASE_URL = "http://localhost:8000"
 
 
-async def run_demo_e2e():
-    """Execute the full demo arc against a running backend."""
-    
-    async with httpx.AsyncClient(timeout=60.0) as http:
-        # 1. Health check
-        r = await http.get(f"{BASE_URL}/api/health")
-        assert r.status_code == 200, "Backend not healthy"
-        console.print("[green]✓[/green] Backend healthy")
-        
-        # 2. Dashboard summary loads
-        r = await http.get(f"{BASE_URL}/api/dashboard/summary")
-        assert r.status_code == 200
-        summary = r.json()
-        assert summary["controls"]["total"] >= 8
-        assert summary["positions"]["derivatives"] >= 3000
-        console.print("[green]✓[/green] Dashboard summary loads")
-        
-        # 3. Fire CFTC trigger and time the cascade
+async def main(quiet: bool = False):
+    log = (lambda s: None) if quiet else console.print
+
+    async with httpx.AsyncClient(base_url="http://localhost:8000", timeout=60) as http:
+        # Health
+        assert (await http.get("/api/health")).status_code == 200
+        log("[green]✓[/green] Backend healthy")
+
+        # Integration smoke
+        h = (await http.get("/api/health/integrations")).json()["data"]
+        bad = [k for k, v in h.items() if v.get("status") != "ok"]
+        assert not bad, f"Integrations not ok: {bad}"
+        log("[green]✓[/green] All integrations ok")
+
+        # Dashboard
+        controls = (await http.get("/api/controls")).json()["data"]
+        assert len(controls["controls"]) == 6
+        log(f"[green]✓[/green] 6 controls visible")
+
+        # SCENARIO 1: schema enrichment headline
         start = time.time()
-        r = await http.post(
-            f"{BASE_URL}/api/internal/trigger",
-            json={"event_type": "cftc_margin_amendment"},
-        )
-        assert r.status_code == 200
-        trigger_id = r.json()["trigger_id"]
-        console.print(f"[blue]▶[/blue] Trigger fired: {trigger_id}")
-        
-        # 4. Poll for cascade completion
-        for attempt in range(30):                    # 30 sec timeout
-            r = await http.get(f"{BASE_URL}/api/triggers/{trigger_id}/status")
-            status = r.json()
-            if status["state"] == "completed":
+        r = await http.post("/api/internal/scenarios/schema_enrichment_fcra")
+        trigger_id = r.json()["data"]["trigger_id"]
+        log(f"[blue]▶[/blue] Fired schema_enrichment_fcra: {trigger_id}")
+
+        for _ in range(50):
+            data = (await http.get(f"/api/triggers/{trigger_id}")).json()["data"]
+            if data.get("auditor_verdict"):
                 break
-            await asyncio.sleep(1)
-        else:
-            raise AssertionError("Cascade did not complete in 30s")
-        
+            await asyncio.sleep(0.2)
         elapsed = time.time() - start
-        console.print(f"[green]✓[/green] Cascade completed in {elapsed:.1f}s")
-        assert elapsed < 20.0, "Cascade too slow for demo"
-        
-        # 5. Verify each agent output
-        r = await http.get(f"{BASE_URL}/api/triggers/{trigger_id}/outputs")
-        outputs = r.json()
-        
-        assert outputs["classifier"]["severity"] == "HIGH"
-        console.print("[green]✓[/green] Classifier: HIGH severity")
-        
-        assert outputs["mapper"]["portfolio_scan"]["affected_positions"] > 800
-        console.print(f"[green]✓[/green] Mapper: {outputs['mapper']['portfolio_scan']['affected_positions']} positions")
-        
-        assert outputs["analyst"]["position_classification"]["BREACH"] > 100
-        console.print(f"[green]✓[/green] Analyst: {outputs['analyst']['position_classification']['BREACH']} BREACH")
-        
-        assert any(
-            c["control_id"] == "CTRL-001"
-            for c in outputs["advisor"]["control_updates"]
-        )
-        console.print("[green]✓[/green] Advisor: CTRL-001 updated")
-        
-        assert outputs["auditor"]["verdict"] in ("approved", "approved_with_warnings")
-        console.print("[green]✓[/green] Auditor: approved")
-        
-        # 6. Verify control status was updated
-        r = await http.get(f"{BASE_URL}/api/controls/CTRL-001")
-        ctrl = r.json()
-        assert ctrl["status"] == "FAILING"
-        assert ctrl["threshold"] == 0.08
-        console.print("[green]✓[/green] CTRL-001 now FAILING with threshold 0.08")
-        
-        # 7. Verify Datadog alert was sent (best-effort)
-        r = await http.get(f"{BASE_URL}/api/internal/recent_alerts")
-        alerts = r.json()
-        assert any(a["control_id"] == "CTRL-001" for a in alerts[-5:])
-        console.print("[green]✓[/green] Datadog alert recorded")
-    
-    console.print(f"\n[bold green]Full demo E2E passed in {elapsed:.1f}s[/bold green]")
+
+        breach = data["impact_report"]["total_breach_count"]
+        assert breach > 1000, f"Expected >1000 breaches, got {breach}"
+        assert elapsed < 10, f"Cascade took {elapsed:.1f}s"
+        log(f"[green]✓[/green] Schema cascade: {breach} breaches in {elapsed:.1f}s")
+
+        # SCENARIO 2: dispute_filed cross-trigger
+        start = time.time()
+        r = await http.post("/api/internal/scenarios/dispute_filed_cross_trigger")
+        trigger_id = r.json()["data"]["trigger_id"]
+
+        for _ in range(50):
+            data = (await http.get(f"/api/triggers/{trigger_id}")).json()["data"]
+            if data.get("auditor_verdict"):
+                break
+            await asyncio.sleep(0.2)
+        elapsed = time.time() - start
+
+        affected = [c["control_id"] for c in data["impact_report"]["affected_controls"]]
+        assert "CTRL-TILA-DISPUTE-RESOLUTION" in affected
+        assert "CTRL-FCRA-DISPUTE-FLAG" in affected
+        log(f"[green]✓[/green] Dispute cascade: 2 controls in {elapsed:.1f}s")
+
+        # x402: 402 then 200
+        r = await http.get("/api/compliance-brief/fcra", follow_redirects=False)
+        assert r.status_code == 402, f"Expected 402 Payment Required, got {r.status_code}"
+        log("[green]✓[/green] x402 returns 402 without payment")
+
+        # (Skipping actual x402-curl payment in this test; manually verify in demo)
+
+    log("\n[bold green]Full demo E2E passed[/bold green]")
 
 
 if __name__ == "__main__":
-    asyncio.run(run_demo_e2e())
+    import sys
+    quiet = "--quiet" in sys.argv
+    asyncio.run(main(quiet=quiet))
 ```
 
 Run this:
-- 3+ times the day before the demo
-- Once right before going on stage (with `--quiet` flag)
+- 3+ times the day before
+- Once at T-30 minutes before stage (with `--quiet`)
 
 ---
 
 ## 6. Pre-Demo Run-Through
 
-The day-of rehearsal. This is the only kind of testing that catches "presenter brain" issues.
-
-### Full Run-Through Checklist
-
 Do this 3 times back-to-back. If any iteration fails or feels rough, do a 4th.
 
-- [ ] Frontend loads in browser (no errors in console)
-- [ ] Sidebar navigation works (Dashboard / Chat / Graph / Controls)
-- [ ] KPI cards show real numbers, not "loading" or "0"
-- [ ] Live feed shows last 5+ regulatory events
-- [ ] Click into a regulation -- side panel shows source text + citations
-- [ ] Open Chat view -- agent avatars visible
-- [ ] Type "hi" in chat -- get a response within 5s
-- [ ] Type "what regulations apply to our IR swaps?" -- multi-agent response
-- [ ] Open Graph view -- nodes render, edges visible
-- [ ] Click a node -- inspector panel opens
-- [ ] Open Controls view -- 8 controls visible with statuses
-- [ ] Fire demo trigger (`python scripts/demo_trigger.py --event=cftc_margin_amendment`)
-- [ ] Cascade visible in Chat view -- all 5 agents speak in order
-- [ ] CTRL-001 changes color from green to red in Controls view
-- [ ] Datadog alert appears in alerts panel
-- [ ] Click "Execute SAR filing" action -- Luminai iframe loads
-- [ ] Tab to Datadog LLM Obs in browser -- AI Agent Console shows the chain
-- [ ] All-clear: no error toasts, no console errors, no stale UI states
+- [ ] Frontend loads (no errors in console)
+- [ ] Sidebar nav works (Dashboard / Controls / Triggers / Briefs / Regulations / Demo)
+- [ ] Dashboard: 4 KPI cards show real numbers
+- [ ] Dashboard: 4 agent cards visible (Policy Crawler, Impact Analysis, Auditor, Monitoring) with right activation modes
+- [ ] Dashboard: 6 control cards visible (3 TILA + 3 FCRA)
+- [ ] Controls view: each control shows status, breach count, owner team
+- [ ] Click into a control: history + check_sql visible
+- [ ] Regulations view: 2 regulations (TILA, FCRA)
+- [ ] Click into FCRA: 4 compliance conditions extracted
+- [ ] Open Demo control panel
+- [ ] Fire `schema_enrichment_fcra` -- chain runs end-to-end in UI < 10s
+- [ ] CTRL-FCRA-STALE-DATA flips PASSING → FAILING with ~1247 breach count
+- [ ] cited.md URL appears in TriggerDetail and is clickable
+- [ ] Datadog alert appears in Datadog UI (with brief URL in alert body)
+- [ ] Fire `dispute_filed_cross_trigger` -- TWO controls move to AT_RISK
+- [ ] Tab to Datadog AI Agent Console -- chain visible with agent nodes
+- [ ] Terminal: `curl -i http://localhost:8000/api/compliance-brief/fcra` returns 402
+- [ ] All clear: no error toasts, no console errors, no stale UI states
 
 ### What Each Team Member Watches For
 
 | Person | Watches For | When |
 |---|---|---|
-| Presenter | UX flow, narrative timing | Throughout |
+| Pranav (presenter) | UX flow, narrative timing | Throughout |
 | Backend dev | Server logs scrolling clean | Continuously |
 | Frontend dev | Browser console errors | Continuously |
-| QA / fifth team member | Datadog UI, Nimble credits left | Continuously |
-| Note-taker | Issues to fix between rehearsals | Throughout |
+| Fourth teammate | Datadog UI, Nimble credits, Senso quota | Continuously |
 
 ---
 
@@ -628,94 +547,66 @@ Do this 3 times back-to-back. If any iteration fails or feels rough, do a 4th.
 
 Stage failures are inevitable. Prepared > improvised.
 
-### Failure Matrix
-
 | Failure Mode | Detection | Recovery |
 |---|---|---|
-| **Cascade doesn't start** | Trigger fired but no agent activity for 5s | Acknowledge: "Our agent system seems slow -- let me show what it does." Switch to recorded demo. |
-| **One agent fails mid-cascade** | Frontend shows partial chain, then nothing | The Auditor catches this. Show: "The Auditor blocked an output -- normally we'd retry but for time let me continue." Skip to next demo beat. |
-| **Cascade completes but with wrong numbers** | Visible to presenter (e.g. "0 positions affected") | Don't draw attention. Move quickly to "what if EU" segment to shift focus. |
-| **Datadog UI doesn't show traces** | Backup screenshot ready on second monitor | Show the screenshot: "Here's what Datadog normally shows" -- judges still understand the integration. |
-| **Luminai iframe doesn't load** | iframe shows error or blank | Skip Luminai segment, go straight to closing pitch. Mention: "Luminai integration is wired but we'll skip for time." |
-| **Frontend crashes (white screen)** | Browser shows blank or error | Press Cmd+R / Ctrl+R to reload. If still broken: full pre-recorded video. |
-| **Internet drops** | Network icon, browser errors | Switch to phone hotspot. Have it tethered and ready BEFORE going on stage. |
-| **ClickHouse Cloud timeout** | Backend logs show timeout errors | Switch `.env` to local, restart backend. Ad-lib for 30s. |
-| **All Gemini calls failing** | Backend logs show 429 or auth errors | OpenRouter fallback should kick in automatically -- verify by checking backend logs. |
+| **Cascade doesn't start** | Trigger fired, no WS update in 3s | "Our agent system seems slow -- let me show what it does." Cut to recorded demo. |
+| **Impact Analysis fails** | Auditor never approves | "The Auditor blocked an output -- normally we'd retry; for time, let me continue." Skip to next beat. |
+| **Wrong breach count** | Visible to presenter | Don't acknowledge. Move quickly to dispute_filed beat to shift focus. |
+| **Datadog UI doesn't load** | Backup screenshot ready | Show the screenshot: "Here's what Datadog normally shows." |
+| **Senso publish fails** | No cited.md URL | "We'd normally publish here -- here's an earlier publish [show pre-fetched cited.md URL in tab]" |
+| **x402 curl returns wrong status** | Terminal output | Skip the curl, mention briefly: "And our briefs are x402-gated for monetization." |
+| **Frontend crashes** | White screen | Cmd+R / Ctrl+R to reload. If still broken: pre-recorded video. |
+| **Internet drops** | Browser errors | Switch to phone hotspot. If still down: pre-recorded video, narrate over. |
+| **ClickHouse Cloud timeout** | Backend logs show timeout | Switch `.env` to local, restart backend. Ad-lib for 30s. |
+| **All Gemini calls 429** | Backend logs | OpenRouter fallback should auto-kick-in -- verify in logs. |
 
 ### The Universal Fallback
 
-If anything seems wrong for more than 10 seconds: cut to pre-recorded video. Narrate over it. Don't lose composure.
+If anything is wrong for >10 seconds: cut to pre-recorded video. Narrate. Don't lose composure.
 
-```
-"Our live system is having a moment -- let me show you the recording we
-captured at the start of the day. Same data, same flow."
-```
-
-### Post-Failure Recovery
-
-After demo:
-- Don't blame anyone, even yourself
-- Don't dwell on what went wrong publicly
-- During Q&A, redirect to: "What I'd love to show you is X" -- pivot to what worked
+> "Our live system is having a moment -- let me show you the recording we captured an hour ago. Same data, same flow."
 
 ---
 
 ## 8. Pre-Recorded Backup Videos
 
-Record these AT LEAST 2 hours before the demo. Re-record after any code change.
+Record at LEAST 2 hours before the demo. Re-record after any code change.
 
-### Required Recordings
+| Video | Length | Purpose |
+|---|---|---|
+| Full demo flow | 3 min | Everything breaks |
+| schema_enrichment_fcra cascade | 30s | Headline beat alone |
+| dispute_filed cascade | 20s | Secondary beat alone |
+| x402 curl flow | 15s | Closing beat alone |
+| Datadog AI Agent Console | 20s | If Datadog UI is slow |
 
-| Video | Length | Purpose | Quality |
-|---|---|---|---|
-| Full demo flow | 5 min | If everything breaks | 1080p, mic audio clean |
-| CFTC cascade only | 30 sec | If just the cascade breaks | 1080p, no audio (you'll narrate live) |
-| "What if EU" segment | 45 sec | If the interaction breaks | 1080p, no audio |
-| Luminai execution | 30 sec | If Luminai breaks | 1080p, no audio |
-| Datadog LLM Obs | 30 sec | If Datadog UI is slow | 1080p, no audio |
+Save each in THREE places:
+1. Laptop `~/demo-recordings/`
+2. Cloud (Dropbox / Google Drive)
+3. USB stick
 
-### Recording Setup
-
-- **Tool:** OBS Studio (free, cross-platform)
-- **Resolution:** 1920x1080
-- **Frame rate:** 30fps
-- **Audio:** USB mic if available, otherwise laptop mic
-- **Mouse:** Highlight cursor (OBS plugin) so judges can follow
-- **Browser:** Hide bookmarks bar, close other tabs
-
-### Storage
-
-Save each video in THREE places:
-1. Local laptop primary location (`~/demo-recordings/`)
-2. Cloud backup (Dropbox / Google Drive)
-3. USB stick or phone for absolute worst case
-
-### Naming Convention
+### Naming
 
 ```
-demo-cftc-cascade-2026-05-25-1430.mp4
-demo-full-flow-2026-05-25-1430.mp4
-demo-luminai-2026-05-25-1430.mp4
-demo-what-if-eu-2026-05-25-1430.mp4
-demo-datadog-llmobs-2026-05-25-1430.mp4
+demo-full-2026-05-23-0900.mp4
+demo-schema-enrichment-2026-05-23-0900.mp4
+demo-dispute-cross-2026-05-23-0900.mp4
+demo-x402-2026-05-23-0900.mp4
+demo-datadog-2026-05-23-0900.mp4
 ```
-
-Date and time so you know which is freshest.
 
 ---
 
 ## AI Tool Hints
 
-If you're an AI tool implementing tests:
+1. **`smoke_test.py` is what matters Day 1.** Get every check passing before writing other tests.
 
-1. **Start with `smoke_test.py`** -- it's the only test that matters Day 1. Get every check passing before moving to other tests.
+2. **Unit tests can wait** -- if smoke + demo E2E pass, ship it.
 
-2. **Unit tests can wait** -- if the smoke test passes and the demo E2E passes, ship it. Add unit tests after demo.
+3. **Never `time.sleep()` in async tests.** Use `await asyncio.sleep()`.
 
-3. **Integration tests need real services** -- they're slow. Run them sparingly. Don't run them in a CI loop.
+4. **Mock the LLM in unit tests, NOT in integration tests.** Integration tests need real Gemini calls to test real failure modes.
 
-4. **Never `time.sleep()` in async tests** -- use `await asyncio.sleep()`. Otherwise the event loop deadlocks.
+5. **The demo E2E test is the spec.** If a code change breaks it, the code is wrong (not the test).
 
-5. **Mock the LLM in unit tests, NOT in integration tests** -- integration tests should exercise real Gemini calls. Otherwise you're just testing your mocks.
-
-6. **The demo E2E test is the spec.** If a code change makes it fail, the change is wrong (not the test).
+6. **For the Auditor test specifically:** seed the test ImpactReport with one obvious hallucination (wrong fine amount, fabricated case citation). The Auditor must reject. If it approves, fix the prompt or grounding logic immediately.

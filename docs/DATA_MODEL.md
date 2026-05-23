@@ -1,774 +1,527 @@
 # DATA_MODEL.md
 
-Complete ClickHouse schema for RegRadar. Every table, every column, every constraint.
+Complete ClickHouse schema documentation. Every table, every column, every constraint.
 
-ClickHouse handles **all five domains**:
-1. Knowledge graph (relational)
-2. Regulatory text + embeddings (vector search)
-3. Synthetic portfolios (analytical queries)
-4. Governance controls (config + time-series test results)
-5. Audit trail (append-only)
-
-No Pinecone. No ChromaDB. No Postgres.
+This document maps 1:1 to `backend/data/schema.sql`. If you change the schema, update both.
 
 ---
 
-## 0. Setup Convention
+## Table of Contents
 
-All tables live in the `regradar` database. Create via:
-
-```sql
-CREATE DATABASE IF NOT EXISTS regradar;
-USE regradar;
-```
-
-ClickHouse version: `25.x` (Cloud) or `clickhouse-server:latest` Docker.
-
-All timestamps are `DateTime64(3)` (millisecond precision, UTC).
-All UUIDs are stored as `String` (not `UUID` type) for portability.
-All money amounts in **USD as Float64**.
+1. [Design Principles](#1-design-principles)
+2. [Domain: Credit Card Accounts](#2-domain-credit-card-accounts)
+3. [Regulations: reg_versions, policy_embeddings, compliance_conditions](#3-regulations-reg_versions-policy_embeddings-compliance_conditions)
+4. [Triggers: policy_changes, schema_events, behavior_events](#4-triggers-policy_changes-schema_events-behavior_events)
+5. [Controls: controls, compliance_scans](#5-controls-controls-compliance_scans)
+6. [Agent Outputs: impact_reports, auditor_verdicts, audit_trail](#6-agent-outputs)
+7. [External Publishing: published_briefs, dd_alerts, x402_fetches](#7-external-publishing)
+8. [Vector Search Setup](#8-vector-search-setup)
+9. [Repository Functions](#9-repository-functions)
 
 ---
 
-## 1. Knowledge Graph -- `kg_nodes`
+## 1. Design Principles
 
-```sql
-CREATE TABLE regradar.kg_nodes (
-    node_id            String,
-    node_type          Enum8(
-        'data_object'        = 1,
-        'regulation'         = 2,
-        'article'            = 3,
-        'obligation'         = 4,
-        'jurisdiction'       = 5,
-        'regulator'          = 6,
-        'product'            = 7,
-        'customer_segment'   = 8,
-        'portfolio_position' = 9
-    ),
-    name               String,
-    metadata           String CODEC(ZSTD(3)),    -- JSON blob
-    embedding          Array(Float32),            -- 768-dim (Gemini)
-    source_url         String DEFAULT '',
-    created_at         DateTime64(3),
-    updated_at         DateTime64(3),
-    version            UInt32 DEFAULT 1,
-    is_deleted         UInt8 DEFAULT 0
-)
-ENGINE = ReplacingMergeTree(version)
-ORDER BY (node_type, node_id);
-```
+### Single store, single source of truth
 
-### Indexes
+Everything lives in ClickHouse 25.8+:
+- Synthetic credit card accounts (the portfolio)
+- Regulation versions + chunked embeddings (vector search)
+- Compliance conditions (structured extractions from regulations)
+- Event tables (the 3 trigger paths)
+- Control definitions + time-series scan results
+- Agent outputs (Impact Analysis reports, Auditor verdicts, audit trail)
+- External effect tracking (cited.md publications, Datadog alerts, x402 fetches)
 
-```sql
--- Vector search index (HNSW)
-ALTER TABLE regradar.kg_nodes
-ADD INDEX embedding_idx embedding
-TYPE vector_similarity('hnsw', 'cosineDistance', 768) GRANULARITY 1;
+No Postgres. No Redis. No separate vector DB.
 
--- Lookup by name
-ALTER TABLE regradar.kg_nodes
-ADD INDEX name_idx name TYPE bloom_filter() GRANULARITY 1;
-```
+### ReplacingMergeTree for mutable state
 
-### Sample Rows
+Tables that represent "current state" (`credit_card_accounts`, `reg_versions`, `controls`, `published_briefs`) use `ReplacingMergeTree(updated_at)`. Background merges deduplicate by ORDER BY key, keeping the row with the highest `updated_at`.
 
-```sql
-INSERT INTO regradar.kg_nodes (node_id, node_type, name, metadata, embedding, source_url, created_at, updated_at) VALUES
-('customer_pii', 'data_object',
- 'Customer Personally Identifiable Information',
- '{"fields":["name","address","dob","email","phone"],"sensitivity":"high"}',
- [/* 768 floats */], '',
- now64(3), now64(3)),
+### MergeTree for append-only
 
-('cftc_margin_rule_2026', 'regulation',
- 'CFTC Margin Requirements for Uncleared Swaps (2026 Amendment)',
- '{"regulator":"CFTC","effective_date":"2026-07-21"}',
- [/* 768 floats */],
- 'https://www.cftc.gov/...',
- now64(3), now64(3));
-```
+Event streams, audit trail, time-series (`audit_trail`, `compliance_scans`, `dd_alerts`, `behavior_events`, `schema_events`) use plain `MergeTree`. Time-partitioned with `PARTITION BY toYYYYMM(...)` for fast time-range queries.
+
+### Foreign key conventions
+
+ClickHouse doesn't enforce FKs. We follow the convention strictly:
+- `account_id` → `credit_card_accounts.account_id`
+- `regulation_id` → `reg_versions.regulation_id`
+- `condition_id` → `compliance_conditions.condition_id`
+- `control_id` → `controls.control_id`
+- `trigger_id` → joins across events + reports + verdicts + alerts
+
+### JSON fields where flexibility matters
+
+For evolving payloads (account attributes, event metadata, agent reasoning), we use `String DEFAULT '{}'` columns named `*_json`. The application is responsible for valid JSON.
 
 ---
 
-## 2. Knowledge Graph -- `kg_edges`
+## 2. Domain: Credit Card Accounts
 
-```sql
-CREATE TABLE regradar.kg_edges (
-    edge_id            String,
-    source_id          String,
-    target_id          String,
-    edge_type          Enum8(
-        'applies_to'        = 1,
-        'requires'          = 2,
-        'exempts'           = 3,
-        'cross_references'  = 4,
-        'supersedes'        = 5,
-        'amends'            = 6,
-        'collects'          = 7,
-        'processes'         = 8,
-        'stores'            = 9,
-        'classified_as'     = 10,
-        'operates_in'       = 11,
-        'serves'            = 12
-    ),
-    confidence         Float32,                  -- 0.0 - 1.0
-    reasoning          String CODEC(ZSTD(3)),
-    metadata           String DEFAULT '{}' CODEC(ZSTD(3)),
-    created_by         String,                   -- agent_id or 'seed'
-    created_at         DateTime64(3),
-    version            UInt32 DEFAULT 1,
-    is_deleted         UInt8 DEFAULT 0
-)
-ENGINE = ReplacingMergeTree(version)
-ORDER BY (source_id, target_id, edge_type);
-```
+### `credit_card_accounts`
 
-### Common Queries
+The synthetic portfolio. ~50,000 accounts seeded.
 
-```sql
--- Which regulations apply to customer_pii?
-SELECT n.name, e.confidence
-FROM kg_edges e
-JOIN kg_nodes n ON n.node_id = e.target_id
-WHERE e.source_id = 'customer_pii'
-  AND e.edge_type = 'applies_to'
-  AND e.is_deleted = 0
-ORDER BY e.confidence DESC;
+| Column | Type | Purpose |
+|---|---|---|
+| `account_id` | String | Primary key |
+| `customer_id` | String | Tie to a customer (synthetic) |
+| `state` | LowCardinality(String) | US state code, for jurisdiction-specific rules |
+| `product_type` | LowCardinality(String) | "standard", "rewards", "secured", "student" |
+| `credit_limit_usd` | Float64 | |
+| `balance_usd` | Float64 | Current outstanding balance |
+| `apr` | Float32 | Effective APR |
+| **TILA / Reg Z fields** | | |
+| `promo_rate` | Nullable(Float32) | Promotional APR if active |
+| `promo_rate_end_date` | Nullable(Date) | When promo expires |
+| `promo_notice_sent_date` | Nullable(Date) | When 45-day notice was sent (TILA 1026.9(g)) |
+| `penalty_rate_applied` | Bool | TRUE if penalty rate currently applied |
+| `penalty_rate_applied_date` | Nullable(Date) | When penalty rate began |
+| `penalty_rate_notice_sent_date` | Nullable(Date) | When 45-day notice was sent for penalty rate |
+| **Dispute fields (TILA + FCRA)** | | |
+| `dispute_filed` | Bool | TRUE if dispute currently active |
+| `dispute_filed_date` | Nullable(Date) | When dispute was filed |
+| `dispute_acknowledged_date` | Nullable(Date) | Issuer ack date (TILA: must be within 30 days) |
+| `dispute_resolved_date` | Nullable(Date) | Issuer resolution date (TILA: within 90 days) |
+| `dispute_bureau_flag` | Nullable(Bool) | FCRA: must be TRUE while dispute active |
+| **FCRA / bureau reporting** | | |
+| `bureau_reported` | Bool | TRUE if reporting to CRAs |
+| `bureau_reported_status` | Nullable(String) | What we tell the CRA |
+| `payment_status` | LowCardinality(String) | What the customer actually is |
+| `original_delinquency_date` | Nullable(Date) | FCRA Section 605: 7-year clock starts here |
+| `charge_off_date` | Nullable(Date) | If charged off |
+| **Lifecycle** | | |
+| `origination_date` | Date | When account was opened |
+| `status` | LowCardinality(String) | "active", "closed", "frozen" |
+| `last_payment_date` | Nullable(Date) | |
+| `last_statement_date` | Nullable(Date) | |
+| `applicable_policies` | Array(String) | IDs of regulations governing this account |
+| `last_updated` | DateTime | Used by ReplacingMergeTree |
+| `attributes_json` | String | Extensible JSON |
 
--- Which data objects are affected by CFTC margin rule?
-SELECT n.name, e.confidence
-FROM kg_edges e
-JOIN kg_nodes n ON n.node_id = e.source_id
-WHERE e.target_id = 'cftc_margin_rule_2026'
-  AND e.edge_type = 'applies_to'
-  AND e.is_deleted = 0;
+**Engine:** `ReplacingMergeTree(last_updated) ORDER BY (state, product_type, account_id)`
 
--- Multi-hop: data_object -> regulation -> obligation
-WITH first_hop AS (
-    SELECT target_id AS reg_id FROM kg_edges
-    WHERE source_id = 'transaction_records'
-      AND edge_type = 'applies_to'
-)
-SELECT o.name AS obligation, fh.reg_id
-FROM kg_edges e
-JOIN kg_nodes o ON o.node_id = e.target_id
-JOIN first_hop fh ON fh.reg_id = e.source_id
-WHERE e.edge_type = 'requires';
-```
+**Why this ORDER BY:** state + product_type is the most common filter (jurisdiction-specific rules). account_id provides uniqueness for replace semantics.
 
----
-
-## 3. Regulatory Documents -- `reg_versions`
-
-Versioned regulatory text. Diff history of every regulation ever scraped.
-
-```sql
-CREATE TABLE regradar.reg_versions (
-    version_id         String,                   -- UUID
-    regulation_id      String,                   -- stable across versions
-    source_url         String,
-    source_name        String,                   -- e.g. "sec_edgar"
-    fetched_at         DateTime64(3),
-    published_at       Nullable(DateTime64(3)),
-    title              String,
-    text               String CODEC(ZSTD(3)),
-    text_hash          String,                   -- SHA256
-    embedding          Array(Float32),           -- 768-dim
-    diff_from_previous String DEFAULT '' CODEC(ZSTD(3)),
-    metadata           String DEFAULT '{}' CODEC(ZSTD(3)),
-    change_type        Enum8(
-        'new_regulation' = 1,
-        'reg_amended'    = 2
-    ) DEFAULT 'new_regulation',
-    is_latest          UInt8 DEFAULT 1
-)
-ENGINE = MergeTree()
-PARTITION BY toYYYYMM(fetched_at)
-ORDER BY (regulation_id, fetched_at);
-```
-
-### Indexes
-
-```sql
-ALTER TABLE regradar.reg_versions
-ADD INDEX reg_embedding_idx embedding
-TYPE vector_similarity('hnsw', 'cosineDistance', 768) GRANULARITY 1;
-```
-
-### Common Queries
-
-```sql
--- Latest version of a regulation
-SELECT * FROM reg_versions
-WHERE regulation_id = 'cftc_margin_rule'
-  AND is_latest = 1
-LIMIT 1;
-
--- All versions of a regulation (for diff view)
-SELECT version_id, fetched_at, text_hash, change_type
-FROM reg_versions
-WHERE regulation_id = 'sec_17a4'
-ORDER BY fetched_at DESC;
-
--- Semantic search across all regs
-SELECT regulation_id, title,
-       cosineDistance(embedding, [/* query embedding */]) AS dist
-FROM reg_versions
-WHERE is_latest = 1
-ORDER BY dist ASC
-LIMIT 10;
-```
-
----
-
-## 4. Derivatives Portfolio -- `derivatives_portfolio`
-
-```sql
-CREATE TABLE regradar.derivatives_portfolio (
-    instrument_id      String,                   -- UUID
-    instrument_type    Enum8(
-        'IR_SWAP'      = 1,
-        'CDS'          = 2,
-        'FX_FORWARD'   = 3,
-        'OPTION'       = 4
-    ),
-    notional_usd       Float64,
-    market_value_usd   Float64,
-    margin_posted_usd  Float64,
-    margin_ratio       Float32,                  -- margin_posted / notional
-    counterparty       String,
-    counterparty_rating String,                  -- "AAA", "BB", etc.
-    cleared            UInt8,                    -- 0 = uncleared, 1 = cleared
-    clearinghouse      Nullable(String),
-    jurisdiction       String,                   -- "us_federal", "eu", etc.
-    trade_date         Date,
-    maturity_date      Date,
-    status             Enum8(
-        'active'   = 1,
-        'closed'   = 2,
-        'pending'  = 3
-    ) DEFAULT 'active',
-    fx_pair            Nullable(String),         -- only for FX_FORWARD
-    underlying         Nullable(String),         -- for OPTION
-    strike_usd         Nullable(Float64),
-    option_type        Nullable(String),         -- "call" / "put"
-    created_at         DateTime64(3),
-    updated_at         DateTime64(3)
-)
-ENGINE = MergeTree()
-ORDER BY (instrument_type, cleared, instrument_id);
-```
-
-### Common Queries
-
-```sql
--- Find all IR swaps below new margin threshold
-SELECT instrument_id, notional_usd, margin_ratio, counterparty
-FROM derivatives_portfolio
-WHERE instrument_type = 'IR_SWAP'
-  AND cleared = 0
-  AND margin_ratio < 0.08
-  AND status = 'active'
-ORDER BY notional_usd DESC;
-
--- Classify positions
-SELECT
-    countIf(margin_ratio < 0.08) AS breach,
-    countIf(margin_ratio >= 0.08 AND margin_ratio < 0.096) AS at_risk,
-    countIf(margin_ratio >= 0.096) AS monitoring
-FROM derivatives_portfolio
-WHERE instrument_type = 'IR_SWAP' AND cleared = 0 AND status = 'active';
-
--- Total exposure by counterparty
-SELECT counterparty, sum(notional_usd) AS total_notional
-FROM derivatives_portfolio
-WHERE status = 'active'
-GROUP BY counterparty
-ORDER BY total_notional DESC;
-```
-
-### Synthetic Data Distribution
-
-When generating ~3,000 positions:
+### Synthetic distribution
 
 | Field | Distribution |
 |---|---|
-| `instrument_type` | 67% IR_SWAP, 13% CDS, 17% FX_FORWARD, 3% OPTION |
-| `notional_usd` | log-normal: μ=14 (≈$1.2M), σ=2 |
-| `margin_ratio` | normal: μ=0.075, σ=0.025, clamped [0.01, 0.30] |
-| `counterparty` | sample from 50 counterparty pool |
-| `cleared` | 30% cleared, 70% uncleared |
-| `jurisdiction` | 80% us_federal, 15% eu, 5% uk |
-| `trade_date` | uniform between 2024-01-01 and today |
-| `maturity_date` | trade_date + 1-7 years |
+| `state` | Weighted: CA (15%), TX (10%), FL (8%), NY (8%), other 50 states evenly |
+| `product_type` | standard 70%, rewards 20%, secured 5%, student 5% |
+| `credit_limit_usd` | log-normal, median $5,000, max $50,000 |
+| `balance_usd` | uniform 0 to 0.85 × credit_limit |
+| `apr` | normal mean 21%, std 4% |
+| `promo_rate` | 25% of accounts have one (active or expired) |
+| `dispute_filed` | ~0.8% of accounts have an active dispute |
+| `penalty_rate_applied` | ~2% have penalty rates applied |
+| `original_delinquency_date` | 12% of accounts have a date; of those, ~10% are >7 years (the demo violations) |
+| `bureau_reported_status` | Set on 90% of accounts; intentionally 3% mismatch payment_status (FCRA violations) |
+
+See `seed/credit_cards/generate_accounts.py` for the exact generator. The distribution is tuned so the demo produces sensible numbers (~1,200 stale-data violations, ~1,500 accuracy mismatches, ~400 active disputes).
 
 ---
 
-## 5. Bonds Portfolio -- `bonds_portfolio`
+## 3. Regulations: reg_versions, policy_embeddings, compliance_conditions
 
+### `reg_versions`
+
+One row per (regulation_id, version_id). Updates create new rows; ReplacingMergeTree deduplicates.
+
+| Column | Type | Purpose |
+|---|---|---|
+| `regulation_id` | String | Stable ID like "tila_1026_9g" |
+| `version_id` | String | Content sha256 |
+| `title` | String | "Notice of Change in Terms" |
+| `regulator` | LowCardinality(String) | "CFPB", "FRB", "FTC", "FDIC" |
+| `regulation_section` | String | "12 CFR 1026.9(g)" |
+| `source_url` | String | Federal Register URL |
+| `content_markdown` | String | Full text |
+| `content_hash` | String | Sha256 (same as version_id) |
+| `is_active` | Bool | True for current version |
+| `effective_date` | Nullable(Date) | When the regulation takes effect |
+| `scraped_at` | DateTime | When we last fetched it |
+| `scraper_used` | LowCardinality(String) | "nimble" \| "firecrawl" |
+
+**Engine:** `ReplacingMergeTree(scraped_at) ORDER BY (regulation_id, version_id)`
+
+### `policy_embeddings`
+
+The 4 policy embeddings. Each regulation gets chunked into ~3-5 embeddings.
+
+| Column | Type | Purpose |
+|---|---|---|
+| `embedding_id` | String | Primary key |
+| `regulation_id` | String | FK to reg_versions |
+| `regulation_section` | String | Denormalized for filter speed |
+| `chunk_text` | String | The text that was embedded |
+| `chunk_index` | UInt32 | Order within regulation |
+| `embedding` | Array(Float32) | 768-dim from text-embedding-005 |
+| `created_at` | DateTime | |
+
+**Engine:** `MergeTree ORDER BY (regulation_id, chunk_index)`
+
+**Vector index:**
 ```sql
-CREATE TABLE regradar.bonds_portfolio (
-    position_id        String,
-    cusip              String,                   -- 9-char CUSIP
-    issuer             String,
-    bond_type          Enum8(
-        'corporate' = 1,
-        'municipal' = 2,
-        'treasury'  = 3,
-        'agency'    = 4
-    ),
-    par_value_usd      Float64,
-    market_value_usd   Float64,
-    purchase_price_usd Float64,
-    coupon_rate        Float32,                  -- annual %
-    payment_frequency  Enum8(
-        'monthly'      = 1,
-        'quarterly'    = 2,
-        'semi_annual'  = 3,
-        'annual'       = 4
-    ),
-    credit_rating      String,                   -- "AAA", "AA+", etc.
-    jurisdiction       String,                   -- "us_federal", "us_state_ca"
-    tax_exempt         UInt8,                    -- 1 if muni tax-exempt
-    issue_date         Date,
-    maturity_date      Date,
-    status             Enum8('held'=1, 'sold'=2) DEFAULT 'held',
-    created_at         DateTime64(3),
-    updated_at         DateTime64(3)
-)
-ENGINE = MergeTree()
-ORDER BY (bond_type, position_id);
+ALTER TABLE policy_embeddings
+ADD INDEX embedding_hnsw_idx embedding
+TYPE vector_similarity('hnsw', 'cosineDistance', 768)
+GRANULARITY 1;
 ```
 
-### Synthetic Distribution
+### `compliance_conditions`
 
-For ~1,500 positions:
-- 47% corporate, 27% municipal, 17% treasury, 9% agency
-- `par_value_usd`: log-normal μ=14, σ=1.5
-- `coupon_rate`: normal μ=4.5%, σ=1.5%, clamped [0.5%, 12%]
-- `credit_rating`: weighted -- AAA 15%, AA 25%, A 30%, BBB 20%, BB 7%, B/CCC 3%
+The structured extractions from the Policy Crawler.
+
+| Column | Type | Purpose |
+|---|---|---|
+| `condition_id` | String | Primary key |
+| `regulation_id` | String | FK |
+| `regulation_section` | String | Denormalized |
+| `condition_kind` | LowCardinality(String) | advance_notice \| time_window \| field_match \| stale_data_limit \| dispute_flag_required |
+| `field_required` | String | Column on credit_card_accounts to evaluate |
+| `operator` | LowCardinality(String) | lt \| lte \| eq \| gte \| gt \| exists \| matches |
+| `threshold_value` | String | Stored as string; cast at query time |
+| `threshold_unit` | LowCardinality(String) | days \| years \| boolean \| string_match \| field_equality |
+| `account_scope_json` | String | JSON dict specifying which accounts (e.g. {"state": ["CA"], "product_type": ["bnpl"]}) |
+| `citation_text` | String | Exact quote from regulation |
+| `severity` | LowCardinality(String) | LOW \| MEDIUM \| HIGH \| CRITICAL |
+| `is_active` | Bool | False = superseded by newer extraction |
+| `extracted_at` | DateTime | |
+| `extracted_by_agent` | LowCardinality(String) | "policy_crawler" |
+
+**Engine:** `ReplacingMergeTree(extracted_at) ORDER BY (regulation_id, condition_id)`
 
 ---
 
-## 6. Lending / BNPL Portfolio -- `lending_portfolio`
+## 4. Triggers: policy_changes, schema_events, behavior_events
 
-```sql
-CREATE TABLE regradar.lending_portfolio (
-    account_id         String,
-    customer_id        String,
-    product_type       Enum8(
-        'BNPL'           = 1,
-        'PERSONAL_LOAN'  = 2,
-        'AUTO_LOAN'      = 3
-    ),
-    principal_usd      Float64,
-    outstanding_usd    Float64,
-    apr                Float32,
-    term_months        UInt16,
-    payments_made      UInt16,
-    status             Enum8(
-        'active'         = 1,
-        'paid_off'       = 2,
-        'delinquent'     = 3,
-        'charged_off'    = 4
-    ) DEFAULT 'active',
-    origination_date   Date,
-    state              String,                   -- 2-char state code
-    disclosure_version String,                   -- e.g. "v3"
-    last_payment_date  Nullable(Date),
-    next_payment_date  Nullable(Date),
-    created_at         DateTime64(3),
-    updated_at         DateTime64(3)
-)
-ENGINE = MergeTree()
-ORDER BY (product_type, state, account_id);
-```
+All three trigger tables share the same shape: append-only, time-ordered, with a `processed` flag the event poller flips after handling.
 
-### Synthetic Distribution
+### `policy_changes`
 
-For ~50,000 accounts:
-- 70% BNPL, 25% personal loan, 5% auto loan
-- `principal_usd`: log-normal μ=6.5 ($665), σ=1.5
-- `state`: weighted by US population (CA 12%, TX 9%, FL 7%, NY 6%, ...)
-- `disclosure_version`: 60% v3, 30% v2, 10% v1 (intentional staleness for demo)
-- `status`: 85% active, 8% paid_off, 5% delinquent, 2% charged_off
+Written by the Policy Crawler when a regulation version changes materially.
 
-### Common Queries
+| Column | Type | Purpose |
+|---|---|---|
+| `trigger_id` | String | Primary key |
+| `regulation_id` | String | Which regulation changed |
+| `prior_version_id` | Nullable(String) | NULL for first sighting |
+| `new_version_id` | String | The new content hash |
+| `is_material_change` | Bool | False for clarifications |
+| `change_summary` | String | Crawler's narrative |
+| `detected_at` | DateTime | |
+| `processed` | Bool | True once Impact Analysis has fired |
+| `processed_at` | Nullable(DateTime) | |
 
-```sql
--- Count California BNPL accounts on stale disclosure
-SELECT count() FROM lending_portfolio
-WHERE product_type = 'BNPL'
-  AND state = 'CA'
-  AND disclosure_version != 'v3'
-  AND status = 'active';
-```
+### `schema_events`
 
----
+Written by ETL / migration scripts when columns are added or populated.
 
-## 7. Governance Controls -- `controls`
+| Column | Type | Purpose |
+|---|---|---|
+| `trigger_id` | String | Primary key |
+| `event_type` | LowCardinality(String) | column_added \| column_populated \| column_dropped |
+| `table_name` | String | Always "credit_card_accounts" for now |
+| `column_name` | String | The affected column |
+| `event_payload_json` | String | Extra metadata (rows affected, source migration) |
+| `occurred_at` | DateTime | |
+| `processed` | Bool | |
+| `processed_at` | Nullable(DateTime) | |
 
-```sql
-CREATE TABLE regradar.controls (
-    control_id         String,                   -- "CTRL-001"
-    name               String,
-    description        String,
-    regulation_ids     Array(String),            -- linked regs
-    metric             String,                   -- "initial_margin", "incident_sla_hours"
-    threshold_value    Float64,
-    threshold_operator Enum8(
-        'gte'  = 1,    -- >=
-        'gt'   = 2,    -- >
-        'lte'  = 3,    -- <=
-        'lt'   = 4,    -- <
-        'eq'   = 5,    -- ==
-        'neq'  = 6     -- !=
-    ),
-    threshold_unit     String,                   -- "percent_notional", "hours"
-    test_sql           String CODEC(ZSTD(3)),    -- the SQL test query
-    owner_team         String,                   -- "risk_team", "compliance_team"
-    test_frequency     Enum8(
-        'realtime' = 1,
-        'hourly'   = 2,
-        'daily'    = 3,
-        'weekly'   = 4,
-        'monthly'  = 5
-    ),
-    current_status     Enum8(
-        'PASSING'        = 1,
-        'AT_RISK'        = 2,
-        'FAILING'        = 3,
-        'NOT_APPLICABLE' = 4,
-        'PENDING_RETEST' = 5
-    ) DEFAULT 'PENDING_RETEST',
-    last_tested_at     Nullable(DateTime64(3)),
-    last_passing_at    Nullable(DateTime64(3)),
-    created_at         DateTime64(3),
-    updated_at         DateTime64(3),
-    version            UInt32 DEFAULT 1
-)
-ENGINE = ReplacingMergeTree(version)
-ORDER BY control_id;
-```
+### `behavior_events`
 
-### Sample Row (CTRL-001 after CFTC amendment)
+Written by application code when an account state changes in a compliance-significant way.
 
-```sql
-INSERT INTO regradar.controls VALUES (
-    'CTRL-001',
-    'IM Adequacy on Uncleared IR Swaps',
-    'Initial margin must be >= 8% of notional on uncleared interest rate swaps',
-    ['cftc_margin_rule_2026'],
-    'initial_margin',
-    0.08,                                     -- was 0.06
-    'gte',
-    'percent_notional',
-    $$SELECT count() FROM derivatives_portfolio
-      WHERE instrument_type='IR_SWAP' AND cleared=0
-        AND margin_ratio < 0.08 AND status='active'$$,
-    'risk_team',
-    'daily',
-    'FAILING',
-    now64(3),
-    null,
-    now64(3),
-    now64(3),
-    2                                          -- bumped from v1
-);
-```
+| Column | Type | Purpose |
+|---|---|---|
+| `trigger_id` | String | Primary key |
+| `event_type` | LowCardinality(String) | dispute_filed \| penalty_rate_applied \| promo_rate_assigned \| charge_off \| payment_missed |
+| `account_id` | String | FK to credit_card_accounts |
+| `event_payload_json` | String | Event-specific metadata |
+| `occurred_at` | DateTime | |
+| `processed` | Bool | |
+| `processed_at` | Nullable(DateTime) | |
 
----
-
-## 8. Control Test Results (Time Series) -- `control_test_results`
-
-Every control test run goes here. Used for trends, dashboards.
-
-```sql
-CREATE TABLE regradar.control_test_results (
-    test_id            String,
-    control_id         String,
-    tested_at          DateTime64(3),
-    status             Enum8(
-        'PASSING'        = 1,
-        'AT_RISK'        = 2,
-        'FAILING'        = 3,
-        'NOT_APPLICABLE' = 4,
-        'ERROR'          = 5
-    ),
-    result_metric_value Float64,               -- raw count or value
-    breach_count       UInt32 DEFAULT 0,
-    at_risk_count      UInt32 DEFAULT 0,
-    sample_breach_ids  Array(String) DEFAULT [],
-    notes              String DEFAULT '',
-    execution_time_ms  UInt32
-)
-ENGINE = MergeTree()
-PARTITION BY toYYYYMM(tested_at)
-ORDER BY (control_id, tested_at);
-```
-
-### Common Queries
-
-```sql
--- Most recent status of each control
-SELECT control_id,
-       argMax(status, tested_at) AS latest_status,
-       argMax(breach_count, tested_at) AS latest_breaches,
-       max(tested_at) AS as_of
-FROM control_test_results
-GROUP BY control_id;
-
--- Trend of CTRL-001 over last 30 days
-SELECT toDate(tested_at) AS day,
-       avg(breach_count) AS avg_breaches
-FROM control_test_results
-WHERE control_id = 'CTRL-001'
-  AND tested_at > now() - INTERVAL 30 DAY
-GROUP BY day
-ORDER BY day;
-```
-
----
-
-## 9. Audit Trail -- `audit_trail`
-
-Append-only log of every agent action.
-
-```sql
-CREATE TABLE regradar.audit_trail (
-    event_id           String,                   -- UUID
-    task_id            String,                   -- ties to blackboard
-    event_type         Enum8(
-        'agent_claim_created'       = 1,
-        'agent_claim_silent'        = 2,
-        'agent_executed'            = 3,
-        'agent_failed'              = 4,
-        'control_updated'           = 5,
-        'control_tested'            = 6,
-        'kg_edge_added'             = 7,
-        'kg_edge_removed'           = 8,
-        'datadog_alert_sent'        = 9,
-        'luminai_workflow_triggered' = 10,
-        'luminai_workflow_completed' = 11,
-        'auditor_approved'          = 12,
-        'auditor_rejected'          = 13,
-        'regulation_ingested'       = 14
-    ),
-    agent_id           String DEFAULT '',
-    trigger_type       String DEFAULT '',
-    payload            String CODEC(ZSTD(3)),    -- full JSON of event
-    user_id            String DEFAULT '',
-    occurred_at        DateTime64(3),
-    duration_ms        Nullable(UInt32)
-)
-ENGINE = MergeTree()
-PARTITION BY toYYYYMM(occurred_at)
-ORDER BY (occurred_at, task_id);
-```
-
----
-
-## 10. Company Profile -- `company_profile`
-
-There's exactly ONE row for the demo (NovaPay), but the schema supports multi-tenant.
-
-```sql
-CREATE TABLE regradar.company_profile (
-    company_id         String,
-    name               String,
-    type               String,
-    annual_volume_usd  Float64,
-    employee_count     UInt32,
-    headquarters       String,
-    founded            UInt16,
-    sponsor_bank       Nullable(String),
-    services           Array(String),
-    data_objects       Array(String),
-    states_operating_in Array(String),
-    customer_segments  Array(String),
-    current_policies   String,                   -- JSON
-    created_at         DateTime64(3),
-    updated_at         DateTime64(3),
-    version            UInt32 DEFAULT 1
-)
-ENGINE = ReplacingMergeTree(version)
-ORDER BY company_id;
-```
-
----
-
-## 11. The "Mega Query" -- Cross-Domain JOIN
-
-This is the demo flex. One query touches 5 tables, returns sub-second.
-
-```sql
--- "Show every IR swap below new margin threshold, with the
---  triggering regulation, affected control, and recent audit events."
-
-SELECT
-    d.instrument_id,
-    d.counterparty,
-    d.notional_usd,
-    d.margin_ratio,
-    r.title AS regulation,
-    c.control_id,
-    c.current_status,
-    a.event_count
-FROM derivatives_portfolio d
-CROSS JOIN (
-    SELECT regulation_id, title
-    FROM reg_versions
-    WHERE is_latest = 1
-      AND regulation_id = 'cftc_margin_rule'
-) r
-JOIN controls c ON has(c.regulation_ids, r.regulation_id)
-LEFT JOIN (
-    SELECT task_id, count() AS event_count
-    FROM audit_trail
-    WHERE occurred_at > now() - INTERVAL 1 HOUR
-    GROUP BY task_id
-) a ON 1=1
-WHERE d.instrument_type = 'IR_SWAP'
-  AND d.cleared = 0
-  AND d.status = 'active'
-  AND d.margin_ratio < 0.08
-  AND c.control_id = 'CTRL-001'
-ORDER BY d.notional_usd DESC
-LIMIT 50;
-```
-
-Run this in front of judges. Sub-second across 5 tables.
-
----
-
-## 12. Setup Script
-
-`scripts/setup_clickhouse.py` creates all tables idempotently:
+### Polling pattern
 
 ```python
-# scripts/setup_clickhouse.py
-"""
-Create all RegRadar tables. Idempotent -- safe to re-run.
-"""
-import clickhouse_connect
-import os
-from pathlib import Path
-
-SCHEMAS_DIR = Path(__file__).parent / "schemas"
-
-def main():
-    client = clickhouse_connect.get_client(
-        host=os.environ["CLICKHOUSE_HOST"],
-        port=int(os.environ.get("CLICKHOUSE_PORT", 8443)),
-        username=os.environ["CLICKHOUSE_USER"],
-        password=os.environ["CLICKHOUSE_PASSWORD"],
-        secure=os.environ.get("CLICKHOUSE_SECURE", "true").lower() == "true",
+# backend/data/repositories.py
+async def get_unprocessed_events(limit: int = 10) -> list[dict]:
+    """Returns the next batch of unprocessed events across all 3 trigger tables, oldest first."""
+    sql = """
+    SELECT * FROM (
+        SELECT trigger_id, 'policy_change' AS event_type, * FROM policy_changes WHERE processed = false
+        UNION ALL
+        SELECT trigger_id, 'schema_event' AS event_type, * FROM schema_events WHERE processed = false
+        UNION ALL
+        SELECT trigger_id, 'behavior_event' AS event_type, * FROM behavior_events WHERE processed = false
     )
-    client.command("CREATE DATABASE IF NOT EXISTS regradar")
-    
-    for sql_file in sorted(SCHEMAS_DIR.glob("*.sql")):
-        ddl = sql_file.read_text()
-        for statement in ddl.split(";"):
-            statement = statement.strip()
-            if statement:
-                client.command(statement)
-        print(f"  ✓ Applied {sql_file.name}")
-    
-    print("\nAll tables ready.")
-
-if __name__ == "__main__":
-    main()
+    ORDER BY occurred_at ASC
+    LIMIT {limit:UInt32}
+    """
+    return await ch.aquery(sql, {"limit": limit})
 ```
-
-Schema files (in `scripts/schemas/`):
-- `01_kg_nodes.sql`
-- `02_kg_edges.sql`
-- `03_reg_versions.sql`
-- `04_derivatives_portfolio.sql`
-- `05_bonds_portfolio.sql`
-- `06_lending_portfolio.sql`
-- `07_controls.sql`
-- `08_control_test_results.sql`
-- `09_audit_trail.sql`
-- `10_company_profile.sql`
 
 ---
 
-## 13. Repository Pattern
+## 5. Controls: controls, compliance_scans
 
-All ClickHouse access goes through repository classes. **No raw SQL in agents or routes.**
+### `controls`
+
+The 6 controls (TILA: 3, FCRA: 3). One row per control. Updated when regulation changes.
+
+| Column | Type | Purpose |
+|---|---|---|
+| `control_id` | String | e.g., "CTRL-TILA-PENALTY-RATE-NOTICE" |
+| `name` | String | Human-readable |
+| `description` | String | What it tests |
+| `related_regulation_id` | String | FK |
+| `related_regulation_section` | String | Denormalized |
+| `threshold_value` | Float64 | Numerical threshold (parsed from compliance_conditions) |
+| `threshold_unit` | String | "days", "boolean", etc. |
+| `threshold_comparison` | Enum | lt \| lte \| eq \| gte \| gt \| exists \| matches |
+| `check_sql` | String | The SQL the Monitoring Agent runs (pre-built at seed time) |
+| `owner_team` | String | e.g., "Bureau Reporting", "Customer Operations" |
+| `test_frequency` | LowCardinality | daily \| weekly \| event_based |
+| `status` | Enum | PASSING \| WARNING \| FAILING \| UNTESTED |
+| `last_tested_at` | Nullable(DateTime) | |
+
+**Engine:** `ReplacingMergeTree(updated_at) ORDER BY control_id`
+
+### The 6 controls (locked)
+
+| Control ID | Name | Regulation | check_sql shape |
+|---|---|---|---|
+| CTRL-TILA-PENALTY-RATE-NOTICE | Penalty Rate 45-Day Notice | 12 CFR 1026.9(g) | accounts where penalty_rate_applied=true AND (penalty_rate_applied_date - penalty_rate_notice_sent_date) < 45 |
+| CTRL-TILA-PROMO-RATE-NOTICE | Promo Rate 45-Day Notice | 12 CFR 1026.9(g) | accounts where promo_rate_end_date - today < 45 AND promo_notice_sent_date IS NULL |
+| CTRL-TILA-DISPUTE-RESOLUTION | Billing Dispute 30/90-Day | 12 CFR 1026.13 | active disputes where (today - dispute_filed_date) > 30 AND dispute_acknowledged_date IS NULL; OR > 90 AND dispute_resolved_date IS NULL |
+| CTRL-FCRA-STALE-DATA | 7-Year Reporting Limit | FCRA Section 605 | bureau_reported=true AND today - original_delinquency_date > 7 years |
+| CTRL-FCRA-BUREAU-ACCURACY | Bureau Status Accuracy | FCRA Section 623(a)(2) | bureau_reported=true AND bureau_reported_status != payment_status |
+| CTRL-FCRA-DISPUTE-FLAG | Dispute Bureau Flag | FCRA Section 623(a)(3) | dispute_filed=true AND (dispute_bureau_flag IS NULL OR dispute_bureau_flag=false) |
+
+Full SQL in `seed/controls.json`.
+
+### `compliance_scans`
+
+Time-series of every control evaluation.
+
+| Column | Type | Purpose |
+|---|---|---|
+| `scan_id` | String | Primary key |
+| `control_id` | String | FK |
+| `scanned_at` | DateTime | |
+| `scan_source` | LowCardinality | daily_monitoring \| event_driven \| manual |
+| `result` | Enum | PASS \| WARN \| FAIL |
+| `breach_count` | UInt32 | |
+| `at_risk_count` | UInt32 | |
+| `breach_balance_usd` | Float64 | |
+| `total_evaluated` | UInt32 | |
+| `notes` | String | |
+
+**Engine:** `MergeTree ORDER BY (control_id, scanned_at) PARTITION BY toYYYYMM(scanned_at)`
+
+---
+
+## 6. Agent Outputs: impact_reports, auditor_verdicts, audit_trail
+
+### `impact_reports`
+
+The Impact Analysis Agent's output.
+
+| Column | Type | Purpose |
+|---|---|---|
+| `trigger_id` | String | FK to the originating event |
+| `source_event_type` | LowCardinality | policy_change \| schema_event \| behavior_event |
+| `affected_controls_json` | String | JSON list of ControlUpdate |
+| `classifications_json` | String | JSON dict[account_id, AccountClassification] |
+| `total_breach_count` | UInt32 | |
+| `total_at_risk_count` | UInt32 | |
+| `total_balance_at_risk_usd` | Float64 | |
+| `citations` | Array(String) | List of regulation_section strings |
+| `suggested_remediation` | Array(String) | |
+| `reasoning` | String | The agent's narrative |
+| `generated_at` | DateTime | |
+| `generated_by_agent` | LowCardinality | "impact_analysis" |
+| `llm_model_used` | LowCardinality | "gemini-3.5-flash" |
+| `llm_tokens_in` | UInt32 | |
+| `llm_tokens_out` | UInt32 | |
+
+### `auditor_verdicts`
+
+The Auditor's verdict on an impact_report.
+
+| Column | Type | Purpose |
+|---|---|---|
+| `trigger_id` | String | FK |
+| `verdict` | LowCardinality | approved \| approved_with_warnings \| rejected |
+| `overall_confidence` | Float32 | 0.0 - 1.0 |
+| `claims_audited_json` | String | List[ClaimAudit] |
+| `warnings` | Array(String) | |
+| `rejection_reasons` | Array(String) | |
+| `safe_to_publish` | Bool | Gate for Senso |
+| `safe_to_alert` | Bool | Gate for Datadog |
+| `audited_at` | DateTime | |
+| `llm_model_used` | LowCardinality | "gemini-3.1-pro" (and/or "check-grounding") |
+
+### `audit_trail`
+
+Append-only event log of everything every agent did.
+
+| Column | Type | Purpose |
+|---|---|---|
+| `audit_id` | String | Primary key |
+| `trigger_id` | String | FK |
+| `agent_id` | LowCardinality | |
+| `event_kind` | LowCardinality | agent_started \| agent_completed \| agent_failed \| grounding_failed \| published \| alerted |
+| `payload_json` | String | |
+| `occurred_at` | DateTime | |
+
+---
+
+## 7. External Publishing: published_briefs, dd_alerts, x402_fetches
+
+### `published_briefs`
+
+What we shipped to cited.md via Senso.
+
+| Column | Type | Purpose |
+|---|---|---|
+| `brief_id` | String | Primary key |
+| `trigger_id` | String | FK |
+| `slug` | String | The cited.md slug |
+| `cited_md_url` | String | Public URL |
+| `senso_remediate_id` | String | Senso's tracking ID |
+| `title` | String | |
+| `body_markdown` | String | The full published content |
+| `tags` | Array(String) | |
+| `related_regulation_id` | String | |
+| `affected_account_count` | UInt32 | |
+| `published_at` | DateTime | |
+| `fetch_count` | UInt32 | Total reads (free + paid) |
+| `paid_fetch_count` | UInt32 | Reads via x402 |
+| `total_usdc_earned` | Float64 | |
+
+### `dd_alerts`
+
+Mirror of Datadog events for UI display.
+
+| Column | Type | Purpose |
+|---|---|---|
+| `alert_id` | String | Primary key |
+| `control_id` | String | |
+| `trigger_id` | Nullable(String) | NULL for daily_monitoring source |
+| `severity` | LowCardinality | info \| warning \| critical |
+| `title` | String | |
+| `body` | String | |
+| `owner_team` | String | |
+| `cited_md_url` | Nullable(String) | Link to the supporting brief |
+| `source` | LowCardinality | event_driven \| daily_monitoring |
+| `sent_at` | DateTime | |
+| `acknowledged_at` | Nullable(DateTime) | |
+
+### `x402_fetches`
+
+Every successful x402 payment for a brief.
+
+| Column | Type | Purpose |
+|---|---|---|
+| `fetch_id` | String | |
+| `brief_id` | String | FK |
+| `fetcher_wallet` | String | Buyer's address |
+| `amount_usdc` | Float64 | |
+| `network` | LowCardinality | "base" |
+| `tx_hash` | String | Onchain settlement proof |
+| `settled_at` | DateTime | |
+
+---
+
+## 8. Vector Search Setup
+
+### Index creation
+
+```sql
+ALTER TABLE policy_embeddings
+ADD INDEX embedding_hnsw_idx embedding
+TYPE vector_similarity('hnsw', 'cosineDistance', 768)
+GRANULARITY 1;
+```
+
+### Cosine similarity query
+
+```sql
+WITH [0.123, 0.456, ...]::Array(Float32) AS query_vec
+SELECT
+    embedding_id,
+    regulation_section,
+    chunk_text,
+    cosineDistance(embedding, query_vec) AS dist
+FROM policy_embeddings
+ORDER BY dist ASC
+LIMIT 5;
+```
+
+**CRITICAL:** The `::Array(Float32)` cast is required. Without it, the type system fails silently and the query returns nothing useful.
+
+### Binary quantization (optional, for scale)
+
+ClickHouse 25.8 added binary quantization for vector indexes. We don't need it at our scale (only 4 regulations × ~5 chunks = 20 embeddings) but production deployments would enable it via index settings.
+
+---
+
+## 9. Repository Functions
+
+All ClickHouse access goes through `backend/data/repositories.py`. No raw client.query() calls elsewhere.
+
+### Catalog (signatures only, see implementation for body)
 
 ```python
-# backend/data/kg_repo.py
-import clickhouse_connect
-from backend.data.schema import KGNode, KGEdge
+# Reads
+async def get_active_conditions_for_event(event: dict) -> list[ComplianceCondition]: ...
+async def get_regulation_text(regulation_section: str) -> str | None: ...
+async def get_control(control_id: str) -> dict: ...
+async def list_all_controls() -> list[dict]: ...
+async def get_last_content_hash(source_url: str) -> str | None: ...
+async def get_unprocessed_events(limit: int = 10) -> list[dict]: ...
+async def query_accounts_summary(where_clause: str, params: dict) -> dict: ...
+async def execute_control_check(control: dict) -> dict: ...
 
-class KGRepository:
-    def __init__(self, client):
-        self.client = client
+# Writes
+async def write_reg_version(result: PolicyExtractionResult) -> None: ...
+async def write_policy_change(result: PolicyExtractionResult) -> None: ...
+async def write_impact_report(report: ImpactReport) -> None: ...
+async def write_auditor_verdict(verdict: AuditorVerdict) -> None: ...
+async def write_compliance_scan(scan: dict) -> None: ...
+async def write_published_brief(brief: PublishedBrief) -> None: ...
+async def write_dd_alert(alert: dict) -> None: ...
+async def write_audit_trail(entry: dict) -> None: ...
+async def write_schema_event(event_type: str, table: str, column: str, payload: dict) -> str: ...
+async def write_behavior_event(event_type: str, account_id: str, payload: dict) -> str: ...
 
-    async def find_applicable_regulations(
-        self, data_object_id: str
-    ) -> list[KGNode]:
-        """All regs that apply to this data object."""
-        query = """
-        SELECT n.* FROM regradar.kg_edges e
-        JOIN regradar.kg_nodes n ON n.node_id = e.target_id
-        WHERE e.source_id = {data_object_id:String}
-          AND e.edge_type = 'applies_to'
-          AND e.is_deleted = 0
-        ORDER BY e.confidence DESC
-        """
-        result = await self.client.query(
-            query, parameters={"data_object_id": data_object_id}
-        )
-        return [KGNode(**row) for row in result.result_rows]
-
-    async def find_candidates(
-        self, topics: list[str], jurisdictions: list[str], regulators: list[str]
-    ) -> list[KGNode]:
-        """Pre-filter likely-affected data objects for Mapper."""
-        ...
-
-    async def add_edge(self, edge: KGEdge) -> str:
-        """Insert new edge, return edge_id."""
-        ...
-
-    async def multi_hop_traverse(
-        self, start_node: str, max_hops: int,
-        edge_types_filter: list[str] | None = None
-    ) -> list[dict]:
-        ...
-
-    async def get_stats(self) -> dict:
-        """For dashboard KPI cards."""
-        return {
-            "nodes_total": ...,
-            "edges_total": ...,
-            "by_type": ...,
-        }
+# Status updates
+async def mark_event_processed(trigger_id: str) -> None: ...
+async def mark_event_failed(trigger_id: str, reason: str) -> None: ...
 ```
 
-Similar repos:
-- `backend/data/portfolio_repo.py` -- derivatives, bonds, lending
-- `backend/data/controls_repo.py` -- controls + test results
-- `backend/data/reg_repo.py` -- reg_versions
-- `backend/data/audit_repo.py` -- audit_trail
+### Why all through one module
+
+- One place to add Datadog tracing
+- One place to handle ClickHouse-specific quirks (parameter binding, vector casting)
+- Easy to swap to async client globally
+- Tests can mock one module instead of N
 
 ---
 
-## 14. Indexing & Performance Notes
+## AI Tool Hints
 
-- ClickHouse `ReplacingMergeTree` is used for any table that has updates (controls, kg_nodes, kg_edges, company_profile)
-- All other tables are `MergeTree` (append-only)
-- Partition by month for time-series tables (audit_trail, control_test_results, reg_versions)
-- HNSW vector indexes on embeddings
-- Bloom filter on `name` columns for fast lookups
+1. **Apply schema.sql first.** Run `scripts/apply_schema.py` (which executes the DDL) before any other code touches ClickHouse.
 
-**Sub-second query target** for all dashboard reads. If a query exceeds 500ms, profile + add index.
+2. **Seed in this order:** regulations + chunks + embeddings → conditions → controls → accounts. The Monitoring Agent needs all 6 controls populated, including their `check_sql`, before it can run.
 
----
+3. **Verify vector index built:** `SELECT * FROM system.data_skipping_indices WHERE table='policy_embeddings'` should show the HNSW index.
 
-Read [API.md](API.md) next for the FastAPI endpoint spec.
+4. **The `applicable_policies` array on accounts is the "tag" that lets the Monitoring Agent filter quickly.** Populate it at seed time based on the account's state, product_type, and lifecycle stage.
+
+5. **When the demo trigger fires `dispute_filed`, the test code MUST write to behavior_events**, not just update credit_card_accounts. The poller listens to behavior_events.

@@ -1,71 +1,55 @@
 # API.md
 
-Complete FastAPI endpoint and WebSocket protocol specification.
+Complete FastAPI endpoint and WebSocket protocol specification for the 4-agent architecture.
 
 ---
 
 ## 0. Conventions
 
 - **Base URL** (local dev): `http://localhost:8000`
-- **All routes prefixed with `/api/`** except WebSocket which is `/ws/`
-- **All responses are JSON** with consistent envelope structure
-- **All routes are async**
-- **Pydantic v2** for all request/response models
-- **CORS** enabled for `http://localhost:5173` (Vite default) and Lovable deployment URL
-- **Auth** for hackathon: a single static API key in header `X-API-Key` (we're not building real auth)
+- **All routes prefixed with `/api/`** except WebSocket (`/ws/`)
+- **All responses are JSON** with the consistent envelope below
+- **All routes are async**, all I/O is Pydantic-validated
+- **CORS** enabled for `http://localhost:5173` (Vite default)
+- **Auth** for the hackathon: a single static API key in header `X-API-Key` -- production auth is TODO
+- **`/api/compliance-brief/{reg_id}` is x402-gated** -- see [INTEGRATIONS.md section 8](INTEGRATIONS.md#8-x402----usdc-micropayments-for-compliance-briefs)
 
 ---
 
 ## 1. Response Envelope
 
-Every response follows this shape:
-
 ```python
 class APIResponse(BaseModel):
     success: bool
-    data: Optional[Any] = None
-    error: Optional[ErrorDetail] = None
-    metadata: dict[str, Any] = {}    # request_id, duration_ms, etc.
+    data: Any | None = None
+    error: ErrorDetail | None = None
+    metadata: dict = {}                    # request_id, duration_ms, etc.
 
 class ErrorDetail(BaseModel):
-    code: str                         # "INTEGRATION_FAILURE", "NOT_FOUND", etc.
+    code: str                              # "VALIDATION_ERROR", "INTEGRATION_FAILURE", etc.
     message: str
-    details: dict[str, Any] = {}
+    details: dict = {}
 ```
 
-### Sample Success Response
+### Success
 
 ```json
 {
   "success": true,
-  "data": {
-    "control_id": "CTRL-001",
-    "status": "FAILING",
-    "breach_count": 214
-  },
+  "data": {"control_id": "CTRL-FCRA-STALE-DATA", "status": "FAILING", "breach_count": 1247},
   "error": null,
-  "metadata": {
-    "request_id": "req_abc123",
-    "duration_ms": 47
-  }
+  "metadata": {"request_id": "req_abc123", "duration_ms": 47}
 }
 ```
 
-### Sample Error Response
+### Error
 
 ```json
 {
   "success": false,
   "data": null,
-  "error": {
-    "code": "CONTROL_NOT_FOUND",
-    "message": "Control with ID CTRL-999 does not exist",
-    "details": {"control_id": "CTRL-999"}
-  },
-  "metadata": {
-    "request_id": "req_xyz789",
-    "duration_ms": 12
-  }
+  "error": {"code": "CONTROL_NOT_FOUND", "message": "...", "details": {"control_id": "CTRL-XYZ"}},
+  "metadata": {"request_id": "req_xyz", "duration_ms": 12}
 }
 ```
 
@@ -73,32 +57,29 @@ class ErrorDetail(BaseModel):
 
 ## 2. Routes Index
 
-| Method | Path | Purpose | Route File |
-|---|---|---|---|
-| GET | `/api/health` | Liveness check | `main.py` |
-| GET | `/api/health/integrations` | Integration smoke test | `main.py` |
-| GET | `/api/company` | Get company profile | `routes_company.py` |
-| PUT | `/api/company` | Update company profile | `routes_company.py` |
-| POST | `/api/company/data-object` | Add data object → triggers Mapper | `routes_company.py` |
-| GET | `/api/graph/stats` | KG stats for KPI cards | `routes_graph.py` |
-| GET | `/api/graph/nodes` | List nodes (filterable) | `routes_graph.py` |
-| GET | `/api/graph/nodes/{node_id}` | Detail for one node | `routes_graph.py` |
-| GET | `/api/graph/edges` | List edges (filterable) | `routes_graph.py` |
-| POST | `/api/graph/simulate` | "What if" simulation | `routes_graph.py` |
-| GET | `/api/feed` | Regulatory feed (paginated) | `routes_feed.py` |
-| GET | `/api/feed/{regulation_id}` | One regulation full detail | `routes_feed.py` |
-| GET | `/api/feed/{regulation_id}/versions` | Version history of a reg | `routes_feed.py` |
-| GET | `/api/feed/{regulation_id}/diff` | Diff between two versions | `routes_feed.py` |
-| GET | `/api/controls` | All controls with status | `routes_controls.py` |
-| GET | `/api/controls/{control_id}` | One control detail | `routes_controls.py` |
-| POST | `/api/controls/{control_id}/test` | Manually retest | `routes_controls.py` |
-| GET | `/api/controls/{control_id}/history` | Test result trend | `routes_controls.py` |
-| GET | `/api/monitor/sources` | Source health (Watcher) | `routes_monitor.py` |
-| GET | `/api/monitor/agents` | Agent runtime stats | `routes_monitor.py` |
-| GET | `/api/monitor/audit-trail` | Recent audit events | `routes_monitor.py` |
-| POST | `/api/demo/trigger` | Manually stage a demo event | `routes_demo.py` |
-| GET | `/api/demo/scenarios` | List staged scenarios | `routes_demo.py` |
-| WS | `/ws/chat` | Bidirectional chat + push | `ws_chat.py` |
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/api/health` | Liveness |
+| GET | `/api/health/integrations` | Per-integration smoke test |
+| GET | `/api/issuer` | Get Pinecrest Bank profile |
+| GET | `/api/controls` | All 6 controls with current status |
+| GET | `/api/controls/{control_id}` | One control detail + recent scans |
+| GET | `/api/controls/{control_id}/history` | Time series of scan results |
+| POST | `/api/controls/{control_id}/recheck` | Manually run a control's SQL now |
+| GET | `/api/accounts/sample` | Sample of credit_card_accounts (for UI) |
+| GET | `/api/accounts/{account_id}` | One account's full record |
+| GET | `/api/regulations` | List loaded regulations |
+| GET | `/api/regulations/{reg_id}` | One regulation + its compliance_conditions |
+| GET | `/api/triggers` | Recent triggers (events) |
+| GET | `/api/triggers/{trigger_id}` | Full trigger chain: impact_report + auditor_verdict + published_brief |
+| GET | `/api/agents/status` | Current state of 4 agents |
+| GET | `/api/audit-trail` | Recent audit events (paginated) |
+| GET | `/api/published-briefs` | Briefs published to cited.md |
+| GET | `/api/compliance-brief/{reg_id}` | **x402-gated.** Returns the structured brief for one regulation. |
+| POST | `/api/internal/trigger` | Demo trigger -- inject a schema_event / behavior_event / policy_change |
+| POST | `/api/internal/scenarios/{scenario}` | Convenience: load + fire a named demo scenario |
+| GET | `/api/internal/scenarios` | List available demo scenarios |
+| WS | `/ws/stream` | Bidirectional stream of trigger updates |
 
 ---
 
@@ -106,556 +87,686 @@ class ErrorDetail(BaseModel):
 
 ### 3.1 GET `/api/health`
 
-Simple liveness check.
-
-**Response:**
 ```json
-{
-  "success": true,
-  "data": {"status": "ok", "version": "0.1.0"},
-  "error": null,
-  "metadata": {"request_id": "..."}
-}
+{"success": true, "data": {"status": "ok", "version": "0.2.0"}, "metadata": {...}}
 ```
 
 ### 3.2 GET `/api/health/integrations`
 
-Smoke-test every integration. Used by `scripts/verify_env.py` and demo dashboard.
+Smoke-tests every integration. Used by the dashboard's "system health" panel and by `scripts/smoke_test.py`.
 
-**Response:**
 ```json
 {
   "success": true,
   "data": {
-    "vertex_ai": {"status": "ok", "latency_ms": 230},
-    "clickhouse": {"status": "ok", "latency_ms": 18},
-    "nimble": {"status": "ok", "latency_ms": 412},
+    "vertex_ai_gemini_flash": {"status": "ok", "latency_ms": 230, "model": "gemini-3.5-flash"},
+    "vertex_ai_gemini_pro": {"status": "ok", "latency_ms": 410, "model": "gemini-3.1-pro"},
+    "vertex_ai_grounding": {"status": "ok", "latency_ms": 180},
+    "vertex_ai_embeddings": {"status": "ok", "latency_ms": 120, "model": "gemini-embedding-001"},
+    "clickhouse": {"status": "ok", "latency_ms": 18, "version": "25.8.1"},
+    "nimble": {"status": "ok", "latency_ms": 412, "credits_remaining": 4520},
     "firecrawl": {"status": "ok", "latency_ms": 380},
-    "datadog": {"status": "ok", "latency_ms": 88},
-    "luminai": {"status": "degraded", "error": "API key missing"}
+    "datadog": {"status": "ok", "latency_ms": 88, "llmobs_enabled": true},
+    "senso": {"status": "ok", "latency_ms": 240, "namespace": "regradar"},
+    "x402": {"status": "ok", "facilitator": "x402.org", "network": "base-sepolia"},
+    "openrouter": {"status": "ok", "latency_ms": 520}
   }
 }
 ```
 
-### 3.3 GET `/api/company`
+### 3.3 GET `/api/issuer`
 
 ```python
-class CompanyProfileResponse(BaseModel):
-    company_id: str
+class IssuerProfileResponse(BaseModel):
+    company_id: str                        # "pinecrest_bank_demo"
     name: str
     type: str
     annual_volume_usd: float
-    employee_count: int
-    headquarters: str
-    sponsor_bank: Optional[str]
-    services: list[str]
-    data_objects: list[str]
-    states_operating_in: list[str]
-    customer_segments: list[str]
-    portfolios_summary: PortfolioSummary    # see below
-
-class PortfolioSummary(BaseModel):
-    derivatives: dict   # {"count": 3000, "total_notional_usd": 12.8e9}
-    bonds: dict
-    lending: dict
+    active_accounts: int
+    states_operating_in: str | list[str]
+    products: list[str]
+    regulators: list[str]                  # ["CFPB", "FRB", "FDIC", "FTC"]
+    applicable_regimes: list[str]          # ["TILA_Regulation_Z", "FCRA"]
+    portfolio_snapshot: PortfolioSnapshot
 ```
-
-### 3.4 POST `/api/company/data-object`
-
-Adds a new data object to the company profile. **Triggers a `data_object_added` event on the Blackboard.**
 
 ```python
-class AddDataObjectRequest(BaseModel):
-    data_object_id: str           # snake_case
-    name: str
-    description: str
-    classified_as: list[str]      # e.g. ["PII"]
-    metadata: dict = {}
-
-class AddDataObjectResponse(BaseModel):
-    data_object_id: str
-    task_id: str                   # the orchestration task triggered
-    estimated_completion_seconds: int
+class PortfolioSnapshot(BaseModel):
+    total_accounts: int
+    total_balance_usd: float
+    by_product: dict[str, int]             # {"standard": 35000, "rewards": 10000, ...}
+    by_state_top10: list[tuple[str, int]]
+    disputes_active: int
+    penalty_rates_active: int
+    bureau_reported: int
 ```
 
-The frontend should subscribe to `/ws/chat` and listen for `task_complete` events with this `task_id`.
-
-### 3.5 GET `/api/graph/stats`
-
-```python
-class GraphStatsResponse(BaseModel):
-    nodes_total: int
-    edges_total: int
-    nodes_by_type: dict[str, int]
-    edges_by_type: dict[str, int]
-    most_connected_data_object: str
-    most_referenced_regulation: str
-```
-
-### 3.6 GET `/api/graph/nodes`
-
-Query params:
-- `node_type` (optional, repeatable)
-- `search` (text search by name)
-- `limit` (default 50, max 500)
-- `offset` (default 0)
-
-### 3.7 POST `/api/graph/simulate`
-
-"What if" simulation. Computes new edges WITHOUT persisting.
-
-```python
-class SimulationRequest(BaseModel):
-    change_type: Literal[
-        "add_jurisdiction", "add_data_object", "add_product"
-    ]
-    payload: dict        # depends on change_type
-
-class SimulationResponse(BaseModel):
-    new_edges_simulated: list[ProposedEdge]
-    affected_regulations: list[str]
-    affected_controls: list[str]
-    summary: str
-```
-
-Example request:
-```json
-{
-  "change_type": "add_jurisdiction",
-  "payload": {"jurisdiction": "eu"}
-}
-```
-
-### 3.8 GET `/api/feed`
-
-Query params:
-- `severity` (CRITICAL | HIGH | MEDIUM | LOW)
-- `regulator`
-- `topic`
-- `since` (ISO 8601 datetime)
-- `limit` (default 25, max 100)
-- `offset`
-
-```python
-class FeedItem(BaseModel):
-    regulation_id: str
-    title: str
-    summary: str
-    severity: str
-    regulator: list[str]
-    jurisdiction: list[str]
-    topic: list[str]
-    change_type: str
-    fetched_at: datetime
-    affected_data_objects_count: int
-    affected_positions_count: Optional[int]
-    has_active_controls: bool
-
-class FeedResponse(BaseModel):
-    items: list[FeedItem]
-    total: int
-    has_more: bool
-```
-
-### 3.9 GET `/api/feed/{regulation_id}/diff`
-
-Query params:
-- `from_version_id` (optional, default = previous version)
-- `to_version_id` (optional, default = latest)
-
-```python
-class DiffResponse(BaseModel):
-    regulation_id: str
-    from_version: VersionMeta
-    to_version: VersionMeta
-    diff_text: str           # unified diff format
-    semantic_summary: str    # LLM-generated diff summary
-    threshold_changes: list[ThresholdChange]
-```
-
-### 3.10 GET `/api/controls`
+### 3.4 GET `/api/controls`
 
 ```python
 class ControlSummary(BaseModel):
     control_id: str
     name: str
-    current_status: str
+    related_regulation_section: str        # "12 CFR 1026.9(g)"
+    status: Literal["PASSING", "WARNING", "FAILING", "UNTESTED"]
+    breach_count: int
+    breach_balance_usd: float
+    last_tested_at: datetime | None
     owner_team: str
-    last_tested_at: Optional[datetime]
-    affected_positions_count: int
+    severity: Literal["LOW", "MEDIUM", "HIGH", "CRITICAL"]
+
 
 class ControlsListResponse(BaseModel):
     controls: list[ControlSummary]
-    summary: dict   # {"PASSING": 5, "AT_RISK": 2, "FAILING": 1}
+    summary: dict[str, int]                # {"PASSING": 3, "WARNING": 1, "FAILING": 2}
+    last_full_sweep_at: datetime
 ```
 
-### 3.11 POST `/api/controls/{control_id}/test`
+### 3.5 GET `/api/controls/{control_id}`
 
-Manually retest a control. Synchronous (sub-second).
+Same fields as `ControlSummary` plus:
 
 ```python
-class ControlTestResponse(BaseModel):
-    control_id: str
-    status: str
+class ControlDetail(ControlSummary):
+    description: str
+    check_sql: str                         # the actual SQL the Monitoring Agent runs
+    sample_breach_account_ids: list[str]   # up to 20
+    recent_scans: list[ScanResult]         # last 30 scans
+
+
+class ScanResult(BaseModel):
+    scan_id: str
+    scanned_at: datetime
+    scan_source: Literal["daily_monitoring", "event_driven", "manual"]
+    result: Literal["PASS", "WARN", "FAIL"]
     breach_count: int
     at_risk_count: int
-    tested_at: datetime
-    sample_breach_ids: list[str]
-    execution_time_ms: int
+    breach_balance_usd: float
 ```
 
-### 3.12 GET `/api/monitor/agents`
+### 3.6 POST `/api/controls/{control_id}/recheck`
+
+Manually re-run a control's `check_sql`. Synchronous, sub-second.
+
+Request body: `{}` (no params).
+
+Response: `ScanResult` (defined above).
+
+### 3.7 GET `/api/accounts/sample`
+
+Query params: `limit` (default 20, max 100), `product_type`, `state`, `has_dispute`, `has_penalty_rate`, `bureau_mismatch_only`.
+
+Returns a sample of `credit_card_accounts` for UI display.
 
 ```python
-class AgentRuntimeStats(BaseModel):
-    agent_id: str
+class AccountSummary(BaseModel):
+    account_id: str
+    state: str
+    product_type: str
+    credit_limit_usd: float
+    balance_usd: float
+    payment_status: str
+    bureau_reported_status: str | None
+    dispute_filed: bool
+    promo_rate: float | None
+    promo_rate_end_date: date | None
+    promo_notice_sent_date: date | None
+    penalty_rate_applied: bool
+    original_delinquency_date: date | None
+```
+
+### 3.8 GET `/api/regulations`
+
+```python
+class RegulationSummary(BaseModel):
+    regulation_id: str                     # "tila_reg_z" | "fcra"
+    title: str
+    regulator: str
+    regulation_section_top: str            # "12 CFR 1026" | "15 USC 1681"
+    n_conditions_extracted: int
+    n_controls: int
+    last_seen_at: datetime
+```
+
+### 3.9 GET `/api/regulations/{reg_id}`
+
+```python
+class RegulationDetail(RegulationSummary):
+    source_url: str
+    content_markdown: str
+    compliance_conditions: list[ComplianceConditionDetail]
+    controls: list[ControlSummary]
+
+
+class ComplianceConditionDetail(BaseModel):
+    condition_id: str
+    regulation_section: str
+    condition_kind: str
+    field_required: str
+    operator: str
+    threshold_value: str
+    threshold_unit: str
+    severity: str
+    citation_text: str
+    extracted_at: datetime
+```
+
+### 3.10 GET `/api/triggers`
+
+Query params: `limit` (default 20), `trigger_type` (`policy_change` | `schema_event` | `behavior_event`), `since` (ISO 8601).
+
+```python
+class TriggerSummary(BaseModel):
+    trigger_id: str
+    trigger_type: Literal["policy_change", "schema_event", "behavior_event"]
+    occurred_at: datetime
+    processed: bool
+    processed_at: datetime | None
+    impact_report_id: str | None
+    auditor_verdict: str | None            # "approved" | "approved_with_warnings" | "rejected"
+    published_brief_url: str | None
+    affected_controls: list[str]
+```
+
+### 3.11 GET `/api/triggers/{trigger_id}`
+
+Full chain detail for one trigger:
+
+```python
+class TriggerDetail(BaseModel):
+    trigger_id: str
+    trigger_type: str
+    payload: dict                          # the original event row
+    occurred_at: datetime
+    impact_report: ImpactReportFull | None
+    auditor_verdict: AuditorVerdictFull | None
+    published_brief: PublishedBriefSummary | None
+    dd_alerts: list[DDAlertSummary]
+    audit_trail: list[AuditTrailEntry]
+
+
+class ImpactReportFull(BaseModel):
+    trigger_id: str
+    affected_controls: list[ControlUpdate]
+    total_breach_count: int
+    total_at_risk_count: int
+    total_balance_at_risk_usd: float
+    citations: list[str]
+    suggested_remediation: list[str]
+    reasoning: str
+    generated_at: datetime
+    llm_model_used: str                    # "gemini-3.5-flash"
+    llm_tokens_in: int
+    llm_tokens_out: int
+
+
+class AuditorVerdictFull(BaseModel):
+    trigger_id: str
+    verdict: Literal["approved", "approved_with_warnings", "rejected"]
+    overall_confidence: float
+    claims_audited: list[ClaimAudit]
+    warnings: list[str]
+    rejection_reasons: list[str]
+    safe_to_publish: bool
+    safe_to_alert: bool
+    audited_at: datetime
+    llm_model_used: str                    # "gemini-3.1-pro" + "check-grounding"
+```
+
+### 3.12 GET `/api/agents/status`
+
+```python
+class AgentStatus(BaseModel):
+    agent_id: Literal["policy_crawler", "impact_analysis", "auditor", "monitoring"]
     display_name: str
-    model: str
-    total_invocations: int
-    silent_count: int
-    primary_claims: int
-    supporting_claims: int
-    cross_talk_claims: int
-    avg_latency_ms: float
-    tokens_in_total: int
-    tokens_out_total: int
-    last_invocation_at: Optional[datetime]
-    last_error_at: Optional[datetime]
+    activation_mode: Literal["scheduled_hourly", "event_driven", "post_impact_analysis", "scheduled_daily"]
+    model: str | None                      # null for monitoring (zero LLM)
+    last_run_at: datetime | None
+    last_run_status: Literal["success", "failed", "in_progress"] | None
+    total_runs_today: int
+    total_llm_tokens_today: int
+    avg_latency_ms: float | None
 
-class AgentMonitorResponse(BaseModel):
-    agents: list[AgentRuntimeStats]
-    chain_health: ChainHealthMetric
+
+class AgentsStatusResponse(BaseModel):
+    agents: list[AgentStatus]
+    event_poller_lag_ms: int               # how far behind the poller is
+    unprocessed_events: int                # backlog in policy_changes/schema_events/behavior_events
 ```
 
-### 3.13 POST `/api/demo/trigger`
-
-Manually stage a demo event (for use during the pitch).
+### 3.13 GET `/api/published-briefs`
 
 ```python
-class DemoTriggerRequest(BaseModel):
-    scenario: Literal[
-        "cftc_margin_amendment",
-        "sec_cyber_disclosure",
-        "ofac_sanctions_add",
-        "ny_dfs_amendment",
-        "cfpb_disclosure_update"
-    ]
-    artificial_delay_ms: int = 0   # for dramatic effect
+class PublishedBriefSummary(BaseModel):
+    brief_id: str
+    title: str
+    slug: str
+    cited_md_url: str                      # "https://cited.md/regradar/fcra-605-stale-data-2026-05-23"
+    related_regulation_id: str
+    affected_account_count: int
+    published_at: datetime
+    fetch_count: int                       # total reads
+    paid_fetch_count: int                  # via x402
+    total_usdc_earned: float
+```
 
-class DemoTriggerResponse(BaseModel):
+### 3.14 GET `/api/compliance-brief/{reg_id}` -- x402-gated
+
+**This endpoint requires x402 payment.** Returns 402 if no valid `X-PAYMENT` header.
+
+Successful response (after payment):
+
+```python
+class ComplianceBriefResponse(BaseModel):
+    reg_id: str
+    title: str
+    body_markdown: str
+    related_regulation_section: str
+    affected_account_count: int
+    affected_balance_usd: float
+    suggested_remediation: list[str]
+    provenance: ProvenanceMetadata         # auditor_approved, auditor_confidence, etc.
+    cited_md_url: str                      # for reference
+```
+
+See [INTEGRATIONS.md section 8](INTEGRATIONS.md#8-x402----usdc-micropayments-for-compliance-briefs) for the x402 flow.
+
+### 3.15 POST `/api/internal/trigger`
+
+The demo trigger. Inserts a row directly into `policy_changes`, `schema_events`, or `behavior_events`. The Impact Analysis poll worker picks it up within 500ms.
+
+Request:
+
+```python
+class TriggerRequest(BaseModel):
+    trigger_type: Literal["policy_change", "schema_event", "behavior_event"]
+    payload: dict                          # shape depends on trigger_type; see below
+
+
+# For schema_event:
+{
+  "trigger_type": "schema_event",
+  "payload": {
+    "event_type": "column_populated",
+    "table_name": "credit_card_accounts",
+    "column_name": "original_delinquency_date",
+    "event_payload_json": {"migration_id": "mig_demo_2026_05_23", "rows_populated": 6240}
+  }
+}
+
+# For behavior_event:
+{
+  "trigger_type": "behavior_event",
+  "payload": {
+    "event_type": "dispute_filed",
+    "account_id": "acct_002847",
+    "event_payload_json": {"dispute_amount_usd": 1289.42, "merchant": "PERSEUS ONLINE LLC", "reason": "unauthorized_charge"}
+  }
+}
+
+# For policy_change (rare in demo -- usually the Policy Crawler writes these):
+{
+  "trigger_type": "policy_change",
+  "payload": {
+    "regulation_id": "tila_reg_z",
+    "new_version_id": "synthetic_v_demo_2026_05_23",
+    "is_material_change": true,
+    "change_summary": "Hypothetical CFPB amendment: promo notice extended from 45 to 60 days"
+  }
+}
+```
+
+Response:
+
+```python
+class TriggerResponse(BaseModel):
+    trigger_id: str
+    trigger_type: str
+    inserted_at: datetime
+    estimated_pickup_lag_ms: int           # ~500
+```
+
+### 3.16 POST `/api/internal/scenarios/{scenario}`
+
+Convenience wrapper around `/api/internal/trigger`. Loads `seed/demo_events.json` and fires the named scenario:
+
+- `schema_enrichment_fcra` -- the headline demo beat
+- `dispute_filed_cross_trigger` -- the secondary demo beat
+- `policy_change_tila_promo_notice` -- backup scenario
+
+Response: same `TriggerResponse` as above.
+
+### 3.17 GET `/api/internal/scenarios`
+
+Returns the demo scenario catalog from `seed/demo_events.json`.
+
+```python
+class DemoScenario(BaseModel):
     scenario: str
-    task_id: str
-    estimated_chain_duration_seconds: int
+    label: str
+    kind: Literal["policy_change", "schema_event", "behavior_event"]
+    expected_breach_count: int | None
+    expected_controls_to_fail: list[str] | None
+    expected_demo_duration_seconds: int
+
+
+class DemoScenariosResponse(BaseModel):
+    scenarios: list[DemoScenario]
 ```
 
 ---
 
-## 4. WebSocket Protocol -- `/ws/chat`
+## 4. WebSocket Protocol -- `/ws/stream`
+
+Bidirectional stream. The frontend subscribes; the server pushes updates as triggers process. No conversational chat -- just live agent status updates.
 
 ### Connection
 
-Client connects with `X-API-Key` header. Server echoes a `connected` event.
+```
+ws://localhost:8000/ws/stream
+```
 
-```
-ws://localhost:8000/ws/chat
-```
+Headers: `X-API-Key: <static-demo-key>`
+
+Server echoes a `connected` event on accept.
 
 ### Message Envelope
-
-EVERY message (both directions) has this shape:
 
 ```typescript
 interface WSMessage {
   type: WSMessageType;
   payload: Record<string, any>;
-  timestamp: string;            // ISO 8601
-  message_id: string;           // UUID
-  task_id?: string;             // ties to blackboard
-  agent_id?: string;            // sender agent if applicable
+  timestamp: string;                       // ISO 8601
+  message_id: string;                      // UUID
+  trigger_id?: string;                     // present for trigger-scoped messages
+  agent_id?: AgentId;                      // present for agent-scoped messages
 }
+
+type AgentId = "policy_crawler" | "impact_analysis" | "auditor" | "monitoring";
+
+type WSMessageType =
+  | "connected"
+  | "trigger_received"                     // a new row appeared in events table
+  | "agent_started"                        // Impact Analysis or Auditor began running
+  | "agent_tool_call"                      // one of the agent's tools fired
+  | "agent_completed"                      // Impact Analysis or Auditor finished
+  | "control_status_changed"               // a control flipped status
+  | "brief_published"                      // Senso publish succeeded
+  | "datadog_alert_sent"                   // control breach alert fired
+  | "x402_fetch_succeeded"                 // someone paid + fetched a brief
+  | "trigger_complete"                     // full chain done
+  | "trigger_failed"                       // hard failure
+  | "pong";
 ```
 
-### Inbound Message Types (Client → Server)
-
-| Type | Payload | Purpose |
-|---|---|---|
-| `user_message` | `{message: string}` | User sends chat message |
-| `subscribe` | `{topics: string[]}` | Subscribe to push types |
-| `unsubscribe` | `{topics: string[]}` | Unsubscribe |
-| `cancel_task` | `{task_id: string}` | Cancel an in-flight task |
-| `ping` | `{}` | Keepalive |
-
-### Outbound Message Types (Server → Client)
-
-| Type | Sent When |
-|---|---|
-| `connected` | Connection established |
-| `task_started` | Orchestration begins |
-| `agent_claim` | Agent claims a turn |
-| `agent_silent` | Agent decides to stay silent (debug) |
-| `agent_thinking` | Agent execute() started |
-| `agent_response_partial` | Streaming agent token (optional) |
-| `agent_response` | Full agent output ready |
-| `auditor_verdict` | Auditor decision |
-| `task_complete` | Full chain done |
-| `task_failed` | Hard failure |
-| `proactive_message` | Push from heartbeat/watcher |
-| `control_status_changed` | Control updated |
-| `system_notification` | UI alert |
-| `pong` | Response to ping |
-
-### Sample Flow -- CFTC Demo
+### Sample flow -- schema_enrichment_fcra demo
 
 ```
-[Server → Client]
+[Client → Server]
+POST /api/internal/scenarios/schema_enrichment_fcra
+< { "trigger_id": "trg_abc123", ... }
+
+[Server → Client] (over WS)
 {
-  "type": "task_started",
-  "task_id": "task_abc123",
+  "type": "trigger_received",
+  "trigger_id": "trg_abc123",
   "payload": {
-    "trigger_type": "new_regulation",
-    "title": "CFTC Margin Requirements Amendment",
-    "estimated_duration_seconds": 14
+    "trigger_type": "schema_event",
+    "table": "credit_card_accounts",
+    "column": "original_delinquency_date"
   },
-  "timestamp": "2026-05-23T13:00:00.123Z",
-  "message_id": "msg_001"
+  "timestamp": "..."
 }
 
 [Server → Client]
 {
-  "type": "agent_claim",
-  "task_id": "task_abc123",
-  "agent_id": "the_classifier",
-  "payload": {
-    "response_type": "primary",
-    "relevance_score": 0.95
-  },
-  ...
+  "type": "agent_started",
+  "trigger_id": "trg_abc123",
+  "agent_id": "impact_analysis",
+  "payload": {"model": "gemini-3.5-flash"}
 }
 
 [Server → Client]
 {
-  "type": "agent_response",
-  "task_id": "task_abc123",
-  "agent_id": "the_classifier",
+  "type": "agent_tool_call",
+  "trigger_id": "trg_abc123",
+  "agent_id": "impact_analysis",
   "payload": {
-    "output": { /* ClassifierOutput */ },
-    "duration_ms": 3000
-  },
-  ...
+    "tool": "query_accounts",
+    "args": {"where_clause": "bureau_reported = true AND ...", "params": {...}}
+  }
 }
 
-// ... more agent_response messages
+[Server → Client]
+{
+  "type": "agent_completed",
+  "trigger_id": "trg_abc123",
+  "agent_id": "impact_analysis",
+  "payload": {
+    "impact_report_id": "imp_xyz",
+    "total_breach_count": 1247,
+    "total_balance_at_risk_usd": 1975000,
+    "affected_controls": ["CTRL-FCRA-STALE-DATA"]
+  }
+}
 
 [Server → Client]
 {
   "type": "control_status_changed",
-  "task_id": "task_abc123",
+  "trigger_id": "trg_abc123",
   "payload": {
-    "control_id": "CTRL-001",
+    "control_id": "CTRL-FCRA-STALE-DATA",
     "old_status": "PASSING",
     "new_status": "FAILING",
-    "breach_count": 214
-  },
-  ...
+    "breach_count": 1247
+  }
 }
 
 [Server → Client]
 {
-  "type": "auditor_verdict",
-  "task_id": "task_abc123",
-  "agent_id": "the_auditor",
+  "type": "agent_started",
+  "trigger_id": "trg_abc123",
+  "agent_id": "auditor",
+  "payload": {"model": "gemini-3.1-pro"}
+}
+
+[Server → Client]
+{
+  "type": "agent_completed",
+  "trigger_id": "trg_abc123",
+  "agent_id": "auditor",
   "payload": {
     "verdict": "approved",
-    "warnings": [],
-    "citations_verified": 7
-  },
-  ...
+    "overall_confidence": 0.92,
+    "claims_audited": 7,
+    "safe_to_publish": true,
+    "safe_to_alert": true
+  }
 }
 
 [Server → Client]
 {
-  "type": "task_complete",
-  "task_id": "task_abc123",
+  "type": "brief_published",
+  "trigger_id": "trg_abc123",
   "payload": {
-    "duration_ms": 13800,
-    "agents_spoken": ["the_classifier", "the_mapper", "the_analyst", "the_advisor"]
-  },
-  ...
+    "brief_id": "brf_qwe",
+    "cited_md_url": "https://cited.md/regradar/fcra-605-stale-data-2026-05-23"
+  }
 }
-```
 
-### Proactive Push Example
-
-When a regulation is detected outside of any user-initiated task:
-
-```
 [Server → Client]
 {
-  "type": "proactive_message",
-  "task_id": "task_xyz789",
+  "type": "datadog_alert_sent",
+  "trigger_id": "trg_abc123",
   "payload": {
-    "trigger_type": "new_regulation",
-    "preview": "New SEC cybersecurity disclosure rule detected -- 4 of your data objects affected.",
-    "severity": "HIGH"
-  },
-  ...
+    "alert_id": "dda_rty",
+    "control_id": "CTRL-FCRA-STALE-DATA",
+    "severity": "critical"
+  }
+}
+
+[Server → Client]
+{
+  "type": "trigger_complete",
+  "trigger_id": "trg_abc123",
+  "payload": {
+    "duration_ms": 6420,
+    "agents_run": ["impact_analysis", "auditor"],
+    "actions_taken": ["control_updated", "brief_published", "datadog_alerted"]
+  }
 }
 ```
 
-The frontend then opens the task in chat view, showing the cascade as it streams.
+### Inbound from client
+
+| Type | Payload | Purpose |
+|---|---|---|
+| `subscribe` | `{topics: ["trigger.*"]}` | Subscribe to specific message types (default: all) |
+| `unsubscribe` | `{topics: [...]}` | Unsubscribe |
+| `ping` | `{}` | Keepalive every 30s |
 
 ---
 
 ## 5. WebSocket Connection Manager
 
 ```python
-# backend/api/ws_chat.py
+# backend/api/ws_stream.py
+"""WebSocket stream for live trigger updates."""
 
-from fastapi import WebSocket, WebSocketDisconnect
-from typing import Dict, Set
-import structlog
+from __future__ import annotations
+
 import asyncio
+import json
+import uuid
+from datetime import datetime, timezone
+from fastapi import APIRouter, Header, WebSocket, WebSocketDisconnect
 
-log = structlog.get_logger()
+from backend.utils.logging import get_logger
+
+log = get_logger(__name__)
+router = APIRouter()
 
 
-class ConnectionManager:
+class StreamManager:
+    """Singleton broadcasting manager."""
+
     def __init__(self):
-        self.active: Dict[str, WebSocket] = {}     # user_id -> ws
-        self.subscriptions: Dict[str, Set[str]] = {}  # user_id -> topics
+        self.connections: dict[str, WebSocket] = {}
 
-    async def connect(self, user_id: str, ws: WebSocket):
+    async def connect(self, client_id: str, ws: WebSocket):
         await ws.accept()
-        self.active[user_id] = ws
-        self.subscriptions[user_id] = set([
-            "task_*", "proactive_message",
-            "control_status_changed", "system_notification"
-        ])
-        log.info("ws_connected", user_id=user_id)
+        self.connections[client_id] = ws
+        log.info("ws.connected", client_id=client_id)
 
-    def disconnect(self, user_id: str):
-        self.active.pop(user_id, None)
-        self.subscriptions.pop(user_id, None)
-        log.info("ws_disconnected", user_id=user_id)
+    def disconnect(self, client_id: str):
+        self.connections.pop(client_id, None)
+        log.info("ws.disconnected", client_id=client_id)
 
-    async def send_to_user(self, user_id: str, message: dict):
-        ws = self.active.get(user_id)
-        if ws is None:
-            log.warning("ws_send_failed_no_user", user_id=user_id)
-            return
-        try:
-            await ws.send_json(message)
-        except Exception as e:
-            log.warning("ws_send_failed", user_id=user_id, error=str(e))
-            self.disconnect(user_id)
-
-    async def broadcast(self, message: dict, topic_filter: str | None = None):
-        """Send to all subscribers (for hackathon: just send to all)."""
-        await asyncio.gather(*[
-            self.send_to_user(uid, message)
-            for uid in list(self.active.keys())
-        ])
+    async def broadcast(self, message: dict):
+        """Send to all connected clients. Drop failed ones."""
+        dead = []
+        for cid, ws in self.connections.items():
+            try:
+                await ws.send_json(message)
+            except Exception as e:
+                log.warning("ws.send_failed", client_id=cid, error=str(e))
+                dead.append(cid)
+        for cid in dead:
+            self.disconnect(cid)
 
 
-# Singleton
-manager = ConnectionManager()
+stream = StreamManager()
 
 
-@router.websocket("/ws/chat")
-async def websocket_endpoint(ws: WebSocket, x_api_key: str = Header(None)):
-    if x_api_key != settings.API_KEY:
+def emit(*, type_: str, payload: dict, trigger_id: str | None = None, agent_id: str | None = None):
+    """Fire-and-forget broadcast. Called from agent runs + orchestrator."""
+    msg = {
+        "type": type_,
+        "payload": payload,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "message_id": str(uuid.uuid4()),
+    }
+    if trigger_id:
+        msg["trigger_id"] = trigger_id
+    if agent_id:
+        msg["agent_id"] = agent_id
+    asyncio.create_task(stream.broadcast(msg))
+
+
+@router.websocket("/ws/stream")
+async def websocket_endpoint(ws: WebSocket, x_api_key: str | None = Header(None)):
+    # Hackathon auth: single static key from env
+    import os
+    if x_api_key != os.environ.get("APP_DEMO_API_KEY", "regradar-demo"):
         await ws.close(code=4001, reason="Unauthorized")
         return
-    
-    user_id = "default_user"  # hackathon: single-user demo
-    await manager.connect(user_id, ws)
-    
+
+    client_id = str(uuid.uuid4())
+    await stream.connect(client_id, ws)
+
     try:
-        # Send initial state
-        await manager.send_to_user(user_id, {
+        # Send connected event
+        await ws.send_json({
             "type": "connected",
-            "payload": {"user_id": user_id, "subscriptions": list(manager.subscriptions[user_id])},
-            "timestamp": now_iso(),
-            "message_id": uuid7(),
+            "payload": {"client_id": client_id},
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "message_id": str(uuid.uuid4()),
         })
-        
+
         while True:
             raw = await ws.receive_json()
             msg_type = raw.get("type")
-            
             if msg_type == "ping":
-                await manager.send_to_user(user_id, {
-                    "type": "pong", "payload": {}, "timestamp": now_iso(),
-                    "message_id": uuid7(),
+                await ws.send_json({
+                    "type": "pong",
+                    "payload": {},
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "message_id": str(uuid.uuid4()),
                 })
-            elif msg_type == "user_message":
-                # Spawn orchestration task
-                asyncio.create_task(handle_user_message(user_id, raw["payload"]))
-            elif msg_type == "subscribe":
-                manager.subscriptions[user_id].update(raw["payload"]["topics"])
-            elif msg_type == "unsubscribe":
-                manager.subscriptions[user_id].difference_update(raw["payload"]["topics"])
-            elif msg_type == "cancel_task":
-                await cancel_task(raw["payload"]["task_id"])
+            elif msg_type in ("subscribe", "unsubscribe"):
+                # For hackathon: all clients get all events; ignore subscribe filtering
+                pass
             else:
-                log.warning("ws_unknown_message_type", type=msg_type)
-    
+                log.warning("ws.unknown_msg_type", type=msg_type)
     except WebSocketDisconnect:
-        manager.disconnect(user_id)
+        stream.disconnect(client_id)
     except Exception as e:
-        log.error("ws_handler_error", error=str(e), user_id=user_id)
-        manager.disconnect(user_id)
+        log.error("ws.handler_error", error=str(e), client_id=client_id)
+        stream.disconnect(client_id)
+```
 
+Agent code calls `emit(...)` directly:
 
-async def handle_user_message(user_id: str, payload: dict):
-    """Create blackboard, run orchestration, stream results."""
-    from backend.orchestrator.orchestrator import Orchestrator
-    
-    orchestrator = Orchestrator()
-    blackboard = orchestrator.create_blackboard(
-        trigger_type="user_message",
-        trigger_payload=payload,
-        user_id=user_id,
-    )
-    
-    # Notify task started
-    await manager.send_to_user(user_id, {
-        "type": "task_started",
-        "task_id": blackboard.task_id,
-        "payload": {"trigger_type": "user_message"},
-        ...
-    })
-    
-    # Run with streaming hook
-    await orchestrator.orchestrate(
-        blackboard,
-        stream_callback=lambda msg: manager.send_to_user(user_id, msg)
-    )
-    
-    # Final
-    await manager.send_to_user(user_id, {
-        "type": "task_complete",
-        "task_id": blackboard.task_id,
-        ...
-    })
+```python
+# Inside backend/agents/impact_analysis.py
+from backend.api.ws_stream import emit
+
+async def run_impact_analysis(input):
+    emit(type_="agent_started", trigger_id=input.trigger_id,
+         agent_id="impact_analysis", payload={"model": "gemini-3.5-flash"})
+    ...
+    emit(type_="agent_completed", trigger_id=input.trigger_id,
+         agent_id="impact_analysis",
+         payload={"impact_report_id": report_id, "total_breach_count": breach_count, ...})
 ```
 
 ---
 
-## 6. Error Codes Reference
+## 6. Error Codes
 
 | Code | HTTP Status | When |
 |---|---|---|
 | `UNAUTHORIZED` | 401 | Missing or invalid X-API-Key |
+| `PAYMENT_REQUIRED` | 402 | x402 payment required (compliance-brief route) |
 | `NOT_FOUND` | 404 | Resource doesn't exist |
 | `VALIDATION_ERROR` | 422 | Pydantic validation failed |
-| `INTEGRATION_FAILURE` | 502 | Sponsor integration down |
-| `CONTROL_NOT_FOUND` | 404 | Specific control doesn't exist |
-| `REGULATION_NOT_FOUND` | 404 | Specific regulation doesn't exist |
-| `TASK_NOT_FOUND` | 404 | Task ID unknown |
+| `INTEGRATION_FAILURE` | 502 | External service down |
+| `CONTROL_NOT_FOUND` | 404 | Control ID unknown |
+| `REGULATION_NOT_FOUND` | 404 | Regulation ID unknown |
+| `TRIGGER_NOT_FOUND` | 404 | Trigger ID unknown |
 | `AGENT_TIMEOUT` | 504 | Agent execution exceeded budget |
 | `AUDITOR_REJECTED_FINAL` | 503 | Auditor rejected after max retries |
-| `RATE_LIMIT_EXCEEDED` | 429 | API quota hit |
+| `RATE_LIMIT_EXCEEDED` | 429 | Upstream API quota hit |
 | `INTERNAL_ERROR` | 500 | Catchall |
 
 ---
@@ -664,79 +775,98 @@ async def handle_user_message(user_id: str, payload: dict):
 
 ```python
 # backend/main.py
+import asyncio
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from contextlib import asynccontextmanager
-import structlog
 
-from backend.config import settings
-from backend.logging_setup import configure_logging
-from backend.orchestrator.heartbeat import HeartbeatService
+from backend.utils import env
+env.validate()                             # raises if any required var missing
 
-log = structlog.get_logger()
+from backend.utils.logging import configure_logging, get_logger
+from backend.integrations.clickhouse_client import get_client as get_ch
+from backend.integrations.vertex_ai import _get_provider, _get_genai_client
+from backend.integrations.nimble import _get_client as get_nimble
+from backend.integrations.senso import _get_http as get_senso
+from backend.orchestrator.event_poller import event_poller_loop
+from backend.agents.policy_crawler import policy_crawler_loop
+from backend.agents.monitoring import monitoring_loop
+
+log = get_logger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup + shutdown."""
+    """Pre-warm all integrations + start background loops."""
     configure_logging()
-    log.info("regradar_starting")
-    
-    # Start heartbeat
-    heartbeat = HeartbeatService()
-    heartbeat_task = asyncio.create_task(heartbeat.run())
-    app.state.heartbeat = heartbeat
-    app.state.heartbeat_task = heartbeat_task
-    
+    log.info("regradar.starting")
+
+    # Pre-warm singletons
+    await get_ch()
+    _get_provider()
+    _get_genai_client()
+    get_nimble()
+    get_senso()
+
+    # Background loops
+    tasks = [
+        asyncio.create_task(policy_crawler_loop(), name="policy_crawler_loop"),
+        asyncio.create_task(event_poller_loop(), name="event_poller_loop"),
+        asyncio.create_task(monitoring_loop(), name="monitoring_loop"),
+    ]
+    app.state.background_tasks = tasks
+    log.info("regradar.background_loops_started", n=len(tasks))
+
     yield
-    
-    # Shutdown
-    log.info("regradar_shutting_down")
-    heartbeat_task.cancel()
-    try:
-        await heartbeat_task
-    except asyncio.CancelledError:
-        pass
+
+    log.info("regradar.shutting_down")
+    for t in tasks:
+        t.cancel()
+    for t in tasks:
+        try:
+            await t
+        except asyncio.CancelledError:
+            pass
 
 
-app = FastAPI(
-    title="RegRadar API",
-    version="0.1.0",
-    lifespan=lifespan,
-)
-
+app = FastAPI(title="RegRadar", version="0.2.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://localhost:3000",
-        settings.FRONTEND_URL,
-    ],
+    allow_origins=env.get_list("APP_CORS_ORIGINS"),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-
-# Register routes
+# Register routers
 from backend.api import (
-    routes_company, routes_graph, routes_feed,
-    routes_controls, routes_monitor, routes_demo, ws_chat,
+    routes_health, routes_issuer, routes_controls, routes_accounts,
+    routes_regulations, routes_triggers, routes_agents,
+    routes_published_briefs, routes_brief_x402, routes_internal, ws_stream,
 )
-app.include_router(routes_company.router, prefix="/api/company", tags=["company"])
-app.include_router(routes_graph.router, prefix="/api/graph", tags=["graph"])
-app.include_router(routes_feed.router, prefix="/api/feed", tags=["feed"])
-app.include_router(routes_controls.router, prefix="/api/controls", tags=["controls"])
-app.include_router(routes_monitor.router, prefix="/api/monitor", tags=["monitor"])
-app.include_router(routes_demo.router, prefix="/api/demo", tags=["demo"])
-app.include_router(ws_chat.router)
-
-
-@app.get("/api/health")
-async def health():
-    return {"success": True, "data": {"status": "ok", "version": "0.1.0"}}
+app.include_router(routes_health.router)
+app.include_router(routes_issuer.router)
+app.include_router(routes_controls.router)
+app.include_router(routes_accounts.router)
+app.include_router(routes_regulations.router)
+app.include_router(routes_triggers.router)
+app.include_router(routes_agents.router)
+app.include_router(routes_published_briefs.router)
+app.include_router(routes_brief_x402.router)        # x402-gated
+app.include_router(routes_internal.router)          # demo trigger
+app.include_router(ws_stream.router)
 ```
 
 ---
 
-Read [FRONTEND.md](FRONTEND.md) next.
+## AI Tool Hints
+
+1. **Build routes in this order:** health → issuer → controls → accounts → regulations → triggers → agents → internal/trigger → published-briefs → compliance-brief (x402) → ws_stream. Each builds on the previous's models.
+
+2. **`/api/internal/trigger` is the demo controller.** Test it first with curl before wiring the frontend.
+
+3. **WebSocket emission uses fire-and-forget tasks.** Don't await `broadcast()` from inside agent code -- it would block the agent run.
+
+4. **The x402-gated route MUST sit in its own router file** (`routes_brief_x402.py`) so the middleware decorator doesn't accidentally bleed onto other routes.
+
+5. **All Pydantic models in this file should live in `backend/data/models.py`** as a single catalog. Routes import from there. Don't redefine inline.

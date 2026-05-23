@@ -1,36 +1,54 @@
 # ════════════════════════════════════════════════════════════════
-# RegRadar -- Python Dependencies (pinned for reproducibility)
+# RegRadar -- Python Dependencies (verified May 23, 2026)
+# Stack: Gemini 3.5 Flash + Pydantic AI v1.85+ + ClickHouse 25.8+ + ddtrace 4.8+
 # ════════════════════════════════════════════════════════════════
 
 # ─── Core Web ───
-fastapi==0.115.0
-uvicorn[standard]==0.32.0
-websockets==13.1
-python-dotenv==1.0.1
-pydantic==2.9.2
-pydantic-settings==2.5.2
-httpx==0.27.2
-aiohttp==3.10.10
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+websockets>=13.1
+python-dotenv>=1.0.1
+pydantic>=2.9.2
+pydantic-settings>=2.5.2
+httpx>=0.27.2
+aiohttp>=3.10.10
+
+# ─── Pydantic AI (the agent framework) ───
+# v1.63+ required for full Datadog ddtrace instrumentation of tool calls
+# v1.85+ has the GoogleVertexProvider we use in vertex_ai.py
+pydantic-ai>=1.85.0
 
 # ─── LLM / AI ───
+# google-genai is the UNIFIED SDK (replaces deprecated google.generativeai)
+# Pydantic AI uses google-genai under the hood for the Vertex AI provider
 google-genai>=2.0.0
-google-cloud-discoveryengine==0.13.5
-google-cloud-aiplatform==1.71.1
-openai==1.54.4
+google-cloud-discoveryengine>=0.13.5      # Check Grounding API (the Auditor's spine)
+openai>=1.54.4                            # OpenRouter fallback (OpenAI-compatible API)
 
 # ─── Data ───
-clickhouse-connect[arrow]==0.7.19
-pandas==2.2.3
-numpy==2.1.2
-pyarrow==18.0.0
+clickhouse-connect[arrow]>=0.8.0          # 0.8+ supports ClickHouse 25.8 vector_similarity index
+pandas>=2.2.3
+numpy>=2.1.2
+pyarrow>=18.0.0
 
-# ─── Web Scraping ───
-nimble-python>=0.1.0
-firecrawl-py==1.6.7
+# ─── Web Scraping (Nimble repositioned as Web Search Agents Platform Feb 2026) ───
+# Nimble's Python SDK -- search/extract/crawl/map for AI agents
+nimble-sdk>=1.0.0
+firecrawl-py>=1.6.7                       # silent fallback
+
+# ─── Senso (publish to cited.md) ───
+# No official Python SDK -- we call the REST API directly via httpx
+# Docs: https://docs.senso.ai
+
+# ─── x402 / Coinbase Developer Platform (monetization) ───
+# Optional but high-value for the "Monetize" beat in the demo
+x402>=0.4.0                               # x402.fastapi middleware
+coinbase-cdp>=1.0.0                       # CDP SDK for wallet ops (optional)
 
 # ─── Datadog Observability ───
-ddtrace==2.20.0
-datadog==0.50.1
+# 4.8+ is critical -- it auto-instruments Pydantic AI tool calls + google-genai
+ddtrace>=4.8.0
+datadog>=0.50.1                           # for direct event/metric API
 
 # ─── Resilience ───
 tenacity==9.0.0
