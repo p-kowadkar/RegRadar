@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 Structured logging via structlog + Datadog LLM Observability tagging.
 

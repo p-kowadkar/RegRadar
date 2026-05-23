@@ -23,7 +23,8 @@ from datetime import datetime, timezone
 from typing import Generator
 
 import clickhouse_connect
-import google.generativeai as genai
+from google import genai
+from google.genai import types as genai_types
 from nimble_python import Nimble
 
 from backend.utils.env import get as env_get
@@ -92,10 +93,12 @@ def _nimble_scrape(url: str) -> dict:
         agent=NIMBLE_AGENT_ID,
         params={"url": url},
     )
+    # AgentRunResponse: text lives in result.data.parsing['full_text']
+    parsing = result.data.parsing or {}
     text = (
-        result.get("text")
-        or result.get("content")
-        or result.get("html_text")
+        parsing.get("full_text")
+        or parsing.get("text")
+        or result.data.markdown
         or ""
     )
     return {
@@ -226,22 +229,22 @@ Return JSON matching this schema:
 def extract_compliance_conditions(scraped: dict) -> dict:
     """One LLM call per regulation section. Returns structured compliance conditions."""
     api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("DEEPMIND_API_KEY", "")
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel(
-        model_name="gemini-2.5-flash",
-        generation_config={
-            "response_mime_type": "application/json",
-            "temperature": 0,
-        },
-        system_instruction=_EXTRACTION_SYSTEM_PROMPT,
-    )
+    client = genai.Client(api_key=api_key)
     prompt = _EXTRACTION_USER_TEMPLATE.format(
         regulation_name=scraped["reg_code"],
         section=scraped["section"],
         embedding_key=scraped["embedding_key"],
         raw_text=scraped["text"][:8000],
     )
-    response = model.generate_content(prompt)
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=prompt,
+        config=genai_types.GenerateContentConfig(
+            system_instruction=_EXTRACTION_SYSTEM_PROMPT,
+            response_mime_type="application/json",
+            temperature=0,
+        ),
+    )
     return json.loads(response.text)
 
 
