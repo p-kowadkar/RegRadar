@@ -35,6 +35,9 @@ datadog==0.50.1
 # ─── Resilience ───
 tenacity==9.0.0
 
+# ─── Scheduler ───
+apscheduler==3.11.2
+
 # ─── Logging ───
 structlog==24.4.0
 
