@@ -314,5 +314,111 @@ ORDER BY (settled_at, fetch_id)
 PARTITION BY toYYYYMM(settled_at);
 
 
+-- ─── Impact Analysis Agent ────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS asset_changes (
+    change_event_id    String,
+    asset_id           String,
+    change_type        LowCardinality(String),           -- schema_change, classification_change, access_control_change, location_change, freshness_drift, lineage_change
+    changed_at         DateTime,
+    changed_by         String,
+    previous_state_hash String,
+    new_state_hash     String,
+    change_details     String,                           -- JSON: state fields relevant to the change type
+)
+ENGINE = MergeTree()
+ORDER BY (changed_at, asset_id, change_event_id)
+PARTITION BY toYYYYMM(changed_at);
+
+
+CREATE TABLE IF NOT EXISTS asset_tags (
+    asset_id           String,
+    policy_id          String,
+    tagged_at          DateTime DEFAULT now(),
+    tagged_by          String,
+)
+ENGINE = ReplacingMergeTree(tagged_at)
+ORDER BY (asset_id, policy_id);
+
+
+CREATE TABLE IF NOT EXISTS policy_registry (
+    policy_id          String,
+    version            UInt32,
+    rule_type          LowCardinality(String),           -- schema_constraint, classification_required, access_control, retention_policy, freshness_sla, lineage_restriction
+    rule_params        String,                           -- JSON: rule-specific thresholds and conditions
+    severity           Enum('low'=1, 'medium'=2, 'high'=3, 'critical'=4),
+    active             Bool,
+    notification_config String,                          -- JSON: webhook targets; falls back to global default
+    auto_remediate     Bool DEFAULT 0,
+    created_at         DateTime DEFAULT now(),
+    updated_at         DateTime DEFAULT now(),
+)
+ENGINE = ReplacingMergeTree(updated_at)
+ORDER BY (policy_id, version);
+
+
+CREATE TABLE IF NOT EXISTS violations (
+    violation_id       String,                           -- UUID generated at insert time
+    asset_id           String,
+    policy_id          String,
+    rule_type          LowCardinality(String),
+    reason             String,
+    evidence           String,                           -- JSON: diff or field that triggered the violation
+    severity           Enum('low'=1, 'medium'=2, 'high'=3, 'critical'=4),
+    status             Enum('open'=1, 'resolved'=2, 'suppressed'=3),
+    resolution_type    LowCardinality(String),           -- auto_resolved, manual, suppressed
+    detected_at        DateTime,
+    last_seen_at       DateTime,                         -- ReplacingMergeTree version key
+    resolved_at        Nullable(DateTime),
+    change_event_id    String,                           -- FK → asset_changes.change_event_id
+    triggered_by       LowCardinality(String),           -- asset_change | policy_change
+)
+ENGINE = ReplacingMergeTree(last_seen_at)
+ORDER BY (asset_id, policy_id, violation_id)
+PARTITION BY toYYYYMM(detected_at);
+
+
+CREATE TABLE IF NOT EXISTS agent_state (
+    agent_id           String,
+    last_processed_at  DateTime,
+    last_cursor        String,                           -- ISO timestamp of last processed changed_at
+    cycle_count        UInt64,
+    last_error         String,
+    status             Enum('running'=1, 'paused'=2, 'error'=3),
+    updated_at         DateTime DEFAULT now(),           -- ReplacingMergeTree version key
+)
+ENGINE = ReplacingMergeTree(updated_at)
+ORDER BY agent_id;
+
+
+CREATE TABLE IF NOT EXISTS notification_failures (
+    failure_id         String,
+    violation_id       String,
+    policy_id          String,
+    webhook_url        String,
+    payload_json       String,
+    error              String,
+    attempts           UInt8,
+    failed_at          DateTime DEFAULT now(),
+)
+ENGINE = MergeTree()
+ORDER BY (failed_at, violation_id)
+PARTITION BY toYYYYMM(failed_at);
+
+
+CREATE TABLE IF NOT EXISTS agent_dead_letter (
+    id                 String,
+    agent_id           LowCardinality(String),
+    event_type         LowCardinality(String),
+    payload_json       String,
+    error              String,
+    attempts           UInt8,
+    created_at         DateTime DEFAULT now(),
+    last_attempted_at  DateTime DEFAULT now(),
+)
+ENGINE = MergeTree()
+ORDER BY (created_at, agent_id);
+
+
 -- ─── Done. Verify with:
 -- SELECT name FROM system.tables WHERE database='regradar';

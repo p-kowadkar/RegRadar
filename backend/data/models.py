@@ -427,3 +427,98 @@ class WSAgentOutputMessage(WSMessage):
     """Specialization for when type='agent_output'."""
 
     model_config = ConfigDict(extra="allow")
+
+
+# ════════════════════════════════════════════════════════════════
+# 10. Impact Analysis Agent
+# ════════════════════════════════════════════════════════════════
+
+ImpactSeverity = Literal["low", "medium", "high", "critical"]
+ImpactRuleType = Literal[
+    "schema_constraint",
+    "classification_required",
+    "access_control",
+    "retention_policy",
+    "freshness_sla",
+    "lineage_restriction",
+]
+AssetChangeType = Literal[
+    "schema_change",
+    "classification_change",
+    "access_control_change",
+    "location_change",
+    "freshness_drift",
+    "lineage_change",
+]
+
+
+class AssetChangeEvent(BaseModel):
+    """One row from asset_changes — the trigger for impact analysis."""
+
+    change_event_id: str
+    asset_id: str
+    change_type: AssetChangeType
+    changed_at: datetime
+    changed_by: str
+    previous_state_hash: str
+    new_state_hash: str
+    change_details: dict[str, Any] = Field(default_factory=dict)
+
+
+class PolicyRule(BaseModel):
+    """One active rule from policy_registry."""
+
+    policy_id: str
+    version: int
+    rule_type: ImpactRuleType
+    rule_params: dict[str, Any] = Field(default_factory=dict)
+    severity: ImpactSeverity
+    active: bool
+    notification_config: dict[str, Any] = Field(default_factory=dict)
+    auto_remediate: bool = False
+
+
+class ImpactEvaluationResult(BaseModel):
+    """Output of the Compliance Evaluator for one (asset_change, policy_rule) pair."""
+
+    status: Literal["PASS", "VIOLATION"]
+    policy_id: str
+    asset_id: str
+    rule_type: str
+    reason: str
+    evidence: dict[str, Any] = Field(default_factory=dict)
+    severity: ImpactSeverity
+    evaluated_at: datetime = Field(default_factory=datetime.now)
+
+
+class ViolationRecord(BaseModel):
+    """One row in the violations table."""
+
+    violation_id: str
+    asset_id: str
+    policy_id: str
+    rule_type: str
+    reason: str
+    evidence: dict[str, Any] = Field(default_factory=dict)
+    severity: ImpactSeverity
+    status: Literal["open", "resolved", "suppressed"]
+    resolution_type: str = ""
+    detected_at: datetime
+    last_seen_at: datetime
+    resolved_at: Optional[datetime] = None
+    change_event_id: str
+    triggered_by: str = "asset_change"
+
+
+class ImpactAnalysisCycleResult(BaseModel):
+    """Summary returned after each polling cycle."""
+
+    assets_processed: int = 0
+    events_processed: int = 0
+    new_violations: int = 0
+    resolved_violations: int = 0
+    notifications_sent: int = 0
+    remediations_triggered: int = 0
+    cycle_started_at: datetime
+    cycle_completed_at: Optional[datetime] = None
+    errors: list[str] = Field(default_factory=list)

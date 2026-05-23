@@ -26,6 +26,7 @@ load_dotenv()
 from backend.utils.env import get_int, get as env_get
 from backend.utils.logging import configure_logging, get_logger
 from backend.agents.policy_crawler import run_policy_crawler, get_ch_client
+from backend.agents.impact_analysis import run_impact_analysis_agent
 
 configure_logging()
 log = get_logger(__name__)
@@ -53,6 +54,24 @@ async def crawl_job():
         log.error("scheduler.tick.error", error=str(exc), exc_info=True)
 
 
+async def impact_analysis_job():
+    """Single scheduler tick — runs one impact analysis polling cycle."""
+    started = datetime.now(timezone.utc)
+    log.info("impact_analysis.tick.start", ts=started.isoformat())
+    try:
+        result = await run_impact_analysis_agent(clickhouse_client=get_shared_client())
+        elapsed = (datetime.now(timezone.utc) - started).total_seconds()
+        log.info(
+            "impact_analysis.tick.done",
+            elapsed_sec=round(elapsed, 2),
+            new_violations=result.new_violations,
+            resolved=result.resolved_violations,
+            notifications=result.notifications_sent,
+        )
+    except Exception as exc:
+        log.error("impact_analysis.tick.error", error=str(exc), exc_info=True)
+
+
 def on_job_event(event):
     if event.exception:
         log.error("scheduler.job_failed", job_id=event.job_id, error=str(event.exception))
@@ -61,8 +80,13 @@ def on_job_event(event):
 
 
 async def main():
-    interval_seconds = get_int("WATCHER_SCRAPE_INTERVAL_SECONDS", default=300)
-    log.info("scheduler.starting", interval_seconds=interval_seconds)
+    crawl_interval = get_int("WATCHER_SCRAPE_INTERVAL_SECONDS", default=300)
+    impact_interval = get_int("IMPACT_AGENT_POLL_INTERVAL_SECONDS", default=60)
+    log.info(
+        "scheduler.starting",
+        crawl_interval_seconds=crawl_interval,
+        impact_interval_seconds=impact_interval,
+    )
 
     scheduler = AsyncIOScheduler()
     scheduler.add_listener(on_job_event, EVENT_JOB_EXECUTED | EVENT_JOB_ERROR)
@@ -70,12 +94,23 @@ async def main():
     scheduler.add_job(
         crawl_job,
         trigger="interval",
-        seconds=interval_seconds,
+        seconds=crawl_interval,
         id="policy_crawler",
         name="Policy Crawler",
-        max_instances=1,          # never overlap — one run at a time
-        misfire_grace_time=60,    # skip if >60s late rather than pile up
-        next_run_time=datetime.now(timezone.utc),  # run immediately on start
+        max_instances=1,
+        misfire_grace_time=60,
+        next_run_time=datetime.now(timezone.utc),
+    )
+
+    scheduler.add_job(
+        impact_analysis_job,
+        trigger="interval",
+        seconds=impact_interval,
+        id="impact_analysis",
+        name="Impact Analysis Agent",
+        max_instances=1,          # never overlap — cursor must advance sequentially
+        misfire_grace_time=30,
+        next_run_time=datetime.now(timezone.utc),
     )
 
     scheduler.start()
