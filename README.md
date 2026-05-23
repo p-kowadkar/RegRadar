@@ -69,6 +69,10 @@ Six testable controls. Four policy embeddings. One ClickHouse store.
 
 Compliance decisions are never made by an embedding similarity score -- only by SQL conditions derived from extracted regulatory text.
 
+## Architecture
+
+![RegRadar Architecture](docs/architecture.png)
+
 ```
                      ┌─────────────────────────────────────┐
                      │       Policy Crawler (hourly)       │
