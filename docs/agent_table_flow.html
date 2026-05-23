@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>RegRadar — Agent / Table Flow</title>
+  <style>
+    body {
+      margin: 0;
+      padding: 16px;
+      font-family: "Anthropic Sans", -apple-system, system-ui, "Segoe UI", sans-serif;
+      background: #111110;
+      color: #c2c0b6;
+    }
+    h1 { font-size: 18px; font-weight: 500; margin: 0 0 8px; }
+    .sub { font-size: 12px; opacity: 0.7; margin-bottom: 16px; }
+
+    #ag2 {
+      background: #1a1a18;
+      border-radius: 12px;
+      padding: 20px;
+    }
+    #ag2 svg { width: 100%; height: auto; }
+    #ag2 .nodeLabel { font-family: "Anthropic Sans", sans-serif !important; }
+    #ag2 .edgeLabel {
+      background: #1a1a18 !important;
+      color: #8a8880 !important;
+      font-size: 11px !important;
+    }
+    #ag2 .cluster rect {
+      fill: #222220 !important;
+      stroke: #3a3a38 !important;
+    }
+    #ag2 .cluster .nodeLabel { fill: #9a9890 !important; }
+  </style>
+</head>
+<body>
+  <h1>RegRadar — Agent / Table Flow</h1>
+  <div class="sub">Three agents and the tables each one reads or writes</div>
+  <div id="ag2"></div>
+
+  <script type="module">
+    import mermaid from 'https://esm.sh/mermaid@11/dist/mermaid.esm.min.mjs';
+    await document.fonts.ready;
+
+    mermaid.initialize({
+      startOnLoad: false,
+      theme: 'base',
+      fontFamily: '"Anthropic Sans", sans-serif',
+      flowchart: { curve: 'basis', padding: 24, nodeSpacing: 40, rankSpacing: 60 },
+      themeVariables: {
+        darkMode: true,
+        fontSize: '13px',
+        fontFamily: '"Anthropic Sans", sans-serif',
+        background:          '#1a1a18',
+        mainBkg:             '#242422',
+        nodeBorder:          '#4a4a47',
+        clusterBkg:          '#1e1e1c',
+        clusterBorder:       '#363634',
+        titleColor:          '#c2c0b6',
+        edgeLabelBackground: '#1a1a18',
+        lineColor:           '#5f5e5a',
+        textColor:           '#c2c0b6',
+        primaryColor:        '#242422',
+        primaryBorderColor:  '#4a4a47',
+        primaryTextColor:    '#c2c0b6',
+        secondaryColor:      '#1e1e1c',
+        tertiaryColor:       '#1a1a18',
+        secondaryTextColor:  '#9a9890',
+        tertiaryTextColor:   '#9a9890',
+        labelBackground:     '#1a1a18',
+        labelTextColor:      '#c2c0b6',
+        attributeBackgroundColorEven: '#1e1e1c',
+        attributeBackgroundColorOdd:  '#242422',
+      },
+    });
+
+    const diagram = `flowchart LR
+
+  subgraph TABLES[" "]
+    direction TB
+    REG(["regulations"])
+    PC2(["policy_changes"])
+    SE(["schema_events"])
+    DA(["data_assets"])
+    CDE(["critical_data_elements"])
+    ARM(["asset_regulation_map"])
+    CV(["compliance_violations"])
+    CS(["compliance_scans"])
+    RS(["remediation_steps"])
+  end
+
+  subgraph CRAWLER["Policy Crawler — hourly · 1 LLM call"]
+    CR["Policy Crawler"]
+  end
+
+  subgraph MONITOR["Monitoring Agent — daily · 0 LLM calls"]
+    MA["Monitoring Agent"]
+  end
+
+  subgraph IMPACT["Impact Analysis Agent — event-driven · 1 LLM call"]
+    IA["Impact Analysis Agent"]
+  end
+
+  REG  -- read --> CR
+  CR   -- write --> PC2
+  CR   -. version bump .-> REG
+
+  REG  -- read --> MA
+  DA   -- read --> MA
+  ARM  -- read --> MA
+  MA   -- write --> CS
+  MA   -- write --> CV
+
+  PC2  -- read --> IA
+  SE   -- read --> IA
+  DA   -- read --> IA
+  REG  -. read .-> IA
+  IA   -- write --> CV
+  IA   -- write --> RS
+
+  classDef tbl  fill:#242422,stroke:#4a4a47,color:#b4b2a9,rx:6
+  classDef crlr fill:#083028,stroke:#1d9e75,color:#9fe1cb
+  classDef mon  fill:#071a30,stroke:#185fa5,color:#85b7eb
+  classDef imp  fill:#1e1838,stroke:#534ab7,color:#afa9ec
+  classDef viol fill:#2a1010,stroke:#791f1f,color:#f09595
+  classDef scan fill:#0a1e10,stroke:#27500a,color:#c0dd97
+  classDef rem  fill:#261a06,stroke:#633806,color:#fac775
+
+  class REG,PC2,SE,DA,CDE,ARM tbl
+  class CV viol
+  class CS scan
+  class RS rem
+  class CR crlr
+  class MA mon
+  class IA imp
+`;
+
+    const { svg } = await mermaid.render('ag2-svg', diagram);
+    document.getElementById('ag2').innerHTML = svg;
+  </script>
+</body>
+</html>

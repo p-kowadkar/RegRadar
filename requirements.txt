@@ -31,9 +31,10 @@ pandas>=2.2.3
 numpy>=2.1.2
 pyarrow>=18.0.0
 
-# ─── Web Scraping (Nimble repositioned as Web Search Agents Platform Feb 2026) ───
-# Nimble's Python SDK -- search/extract/crawl/map for AI agents
-nimble-sdk>=1.0.0
+# ─── Web Scraping (Nimble Web Search Agents Platform) ───
+# Package is `nimble_python` on PyPI (the official Nimble web SDK).
+# `nimble-sdk` (no underscore) is HPE Nimble Storage -- different product.
+nimble_python>=0.18.0
 firecrawl-py>=1.6.7                       # silent fallback
 
 # ─── Senso (publish to cited.md) ───

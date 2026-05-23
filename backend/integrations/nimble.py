@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from hashlib import sha256
 from typing import Literal
 
-from nimble_sdk import Nimble
+from nimble_python import Nimble
 from pydantic import BaseModel
 
 from backend.utils.logging import get_logger
@@ -63,15 +63,17 @@ async def scrape_url(url: str) -> ScrapedDocument:
     """Scrape a single URL via Nimble's /extract endpoint.
 
     Returns markdown-formatted content.
-    Raises NimbleError on failure — caller decides whether to fall back to Firecrawl.
+    Raises NimbleError on failure -- caller decides whether to fall back to Firecrawl.
     """
     try:
         result = await asyncio.to_thread(
             _get_client().extract,
             url=url,
-            output_format="markdown",
+            formats=["markdown"],
+            render=False,
         )
-        content = result.content or ""
+        # ExtractResponse: result.data.markdown
+        content = (getattr(result.data, "markdown", None) or "") if getattr(result, "data", None) else ""
         h = sha256(content.encode()).hexdigest()
         log.info("nimble.scrape_success", url=url, content_length=len(content))
         return ScrapedDocument(

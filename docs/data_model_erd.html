@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>RegRadar — Data Model ERD</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body {
+      margin: 0;
+      padding: 16px;
+      font-family: "Anthropic Sans", -apple-system, system-ui, "Segoe UI", sans-serif;
+      background: #f1efe8;
+      color: #3d3d3a;
+    }
+    @media (prefers-color-scheme: dark) {
+      body { background: #1e1e1c; color: #c2c0b6; }
+    }
+    h1 { font-size: 18px; font-weight: 500; margin: 0 0 8px; }
+    .sub { font-size: 12px; opacity: 0.7; margin-bottom: 16px; }
+    #erd { padding: 8px 0; }
+    #erd svg { max-width: 100%; height: auto; }
+  </style>
+</head>
+<body>
+  <h1>RegRadar — Data Model ERD</h1>
+  <div class="sub">9 tables · regulations · assets · violations · remediation</div>
+  <div id="erd"></div>
+
+  <script type="module">
+    import mermaid from 'https://esm.sh/mermaid@11/dist/mermaid.esm.min.mjs';
+
+    const dark = matchMedia('(prefers-color-scheme: dark)').matches;
+    await document.fonts.ready;
+
+    mermaid.initialize({
+      startOnLoad: false,
+      theme: 'base',
+      fontFamily: '"Anthropic Sans", sans-serif',
+      themeVariables: {
+        darkMode: dark,
+        fontSize: '12px',
+        fontFamily: '"Anthropic Sans", sans-serif',
+        lineColor: dark ? '#9c9a92' : '#73726c',
+        textColor: dark ? '#c2c0b6' : '#3d3d3a',
+        primaryColor: dark ? '#2a2a28' : '#f1efe8',
+        primaryBorderColor: dark ? '#5f5e5a' : '#b4b2a9',
+        edgeLabelBackground: dark ? '#1e1e1c' : '#ffffff',
+      },
+    });
+
+    const diagram = `erDiagram
+  regulations {
+    varchar regulation_id PK
+    varchar act
+    varchar reg_code
+    varchar control_name
+    int threshold_days
+    varchar trigger_type
+    varchar embedding_id
+    date effective_date
+    varchar version
+  }
+
+  data_assets {
+    varchar asset_id PK
+    varchar asset_name
+    varchar asset_type
+    varchar system
+    varchar table_name
+    varchar owner_team
+    varchar data_classification
+    bigint row_count_est
+    varchar refresh_cadence
+  }
+
+  critical_data_elements {
+    varchar cde_id PK
+    varchar asset_id FK
+    varchar field_name
+    varchar data_type
+    boolean pii_flag
+    boolean compliance_critical
+    decimal population_rate_pct
+    date last_populated
+    boolean is_schema_enrichment
+    boolean is_behavior_trigger
+  }
+
+  asset_regulation_map {
+    varchar map_id PK
+    varchar asset_id FK
+    varchar regulation_id FK
+    varchar cde_ids
+    varchar compliance_owner
+    boolean in_scope
+  }
+
+  compliance_violations {
+    varchar violation_id PK
+    varchar regulation_id FK
+    varchar asset_id FK
+    varchar cde_id FK
+    varchar account_id
+    varchar violation_type
+    timestamp detected_at
+    varchar trigger_type
+    int days_in_breach
+    varchar severity
+    varchar status
+    varchar remediation_step_id FK
+  }
+
+  remediation_steps {
+    varchar step_id PK
+    varchar regulation_id FK
+    int step_number
+    varchar step_title
+    varchar action_type
+    boolean automated
+    boolean requires_approval
+    text sql_template
+  }
+
+  compliance_scans {
+    varchar scan_id PK
+    varchar regulation_id FK
+    date scan_date
+    int accounts_in_scope
+    int violations_found
+    decimal violation_rate_pct
+    boolean alert_fired
+  }
+
+  policy_changes {
+    varchar change_id PK
+    varchar regulation_id FK
+    timestamp detected_at
+    varchar change_type
+    boolean material
+    varchar impact_asset_ids
+    varchar impact_report_id
+  }
+
+  schema_events {
+    varchar event_id PK
+    varchar asset_id FK
+    varchar event_type
+    varchar field_name
+    timestamp detected_at
+    bigint rows_affected
+    varchar impact_report_id
+  }
+
+  regulations ||--o{ asset_regulation_map : "governs"
+  data_assets ||--o{ asset_regulation_map : "mapped to"
+  data_assets ||--o{ critical_data_elements : "contains"
+  regulations ||--o{ compliance_violations : "violated by"
+  data_assets ||--o{ compliance_violations : "source of"
+  critical_data_elements ||--o{ compliance_violations : "field in breach"
+  regulations ||--o{ remediation_steps : "resolved by"
+  compliance_violations }o--o| remediation_steps : "assigned"
+  regulations ||--o{ compliance_scans : "scanned for"
+  regulations ||--o{ policy_changes : "updated by"
+  data_assets ||--o{ schema_events : "schema changed"
+`;
+
+    const { svg } = await mermaid.render('erd-svg', diagram);
+    document.getElementById('erd').innerHTML = svg;
+
+    // Replace the entity outline path with a rounded rect for nicer corners.
+    document.querySelectorAll('#erd svg .node').forEach(node => {
+      const firstPath = node.querySelector('path[d]');
+      if (!firstPath) return;
+      const d = firstPath.getAttribute('d');
+      const nums = d.match(/-?[\d.]+/g)?.map(Number);
+      if (!nums || nums.length < 8) return;
+      const xs = [nums[0], nums[2], nums[4], nums[6]];
+      const ys = [nums[1], nums[3], nums[5], nums[7]];
+      const x = Math.min(...xs), y = Math.min(...ys);
+      const w = Math.max(...xs) - x, h = Math.max(...ys) - y;
+      const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+      rect.setAttribute('x', x); rect.setAttribute('y', y);
+      rect.setAttribute('width', w); rect.setAttribute('height', h);
+      rect.setAttribute('rx', '8');
+      for (const a of ['fill', 'stroke', 'stroke-width', 'class', 'style']) {
+        if (firstPath.hasAttribute(a)) rect.setAttribute(a, firstPath.getAttribute(a));
+      }
+      firstPath.replaceWith(rect);
+    });
+
+    // Drop the row-divider strokes for a cleaner look.
+    document.querySelectorAll('#erd svg .row-rect-odd path, #erd svg .row-rect-even path')
+      .forEach(p => p.setAttribute('stroke', 'none'));
+  </script>
+</body>
+</html>

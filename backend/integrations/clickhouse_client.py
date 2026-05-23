@@ -1,5 +1,10 @@
 """Async ClickHouse client. All data access goes through repositories.py
-which uses this client. Don't bypass."""
+which uses this client. Don't bypass.
+
+For agents that are sync internally (e.g. impact_analysis), `get_sync_client()`
+is exposed as a per-call factory so concurrent worker threads don't share the
+same HTTP session (clickhouse-connect rejects overlapping queries on one client).
+"""
 
 import os
 
@@ -28,3 +33,20 @@ async def get_client() -> AsyncClient:
         )
         log.info("clickhouse.initialized", host=os.environ["CLICKHOUSE_HOST"])
     return _ASYNC_CLIENT
+
+
+def get_sync_client():
+    """Fresh sync client per call.
+
+    Used by agents that are synchronous internally and by FastAPI handlers
+    that don't want to manage an event loop. clickhouse-connect's HTTP client
+    can't safely be shared across threads, so we always return a new one.
+    """
+    return clickhouse_connect.get_client(
+        host=os.environ["CLICKHOUSE_HOST"],
+        port=int(os.environ.get("CLICKHOUSE_PORT", "8443")),
+        username=os.environ.get("CLICKHOUSE_USER", "default"),
+        password=os.environ.get("CLICKHOUSE_PASSWORD", ""),
+        secure=os.environ.get("CLICKHOUSE_SECURE", "true").lower() == "true",
+        database=os.environ.get("CLICKHOUSE_DATABASE", "regradar"),
+    )

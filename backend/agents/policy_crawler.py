@@ -109,7 +109,6 @@ Rules:
 
 crawler_agent = Agent(
     model=vertex_model("gemini-3.5-flash"),
-    input_type=PolicyCrawlInput,
     output_type=CrawlVerification,
     system_prompt=_SYSTEM_PROMPT,
 )

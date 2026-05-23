@@ -23,7 +23,7 @@ from typing import Any
 
 import httpx
 
-from backend.agents.policy_crawler import get_ch_client
+from backend.integrations.clickhouse_client import get_sync_client
 from backend.data.models import (
     AssetChangeEvent,
     ImpactAnalysisCycleResult,
@@ -810,7 +810,7 @@ async def run_impact_analysis_cycle(ch) -> ImpactAnalysisCycleResult:
 
 async def run_impact_analysis_agent(clickhouse_client=None) -> ImpactAnalysisCycleResult:
     """Entry point — pass an existing ClickHouse client or one is created from env."""
-    ch = clickhouse_client or get_ch_client()
+    ch = clickhouse_client or get_sync_client()
     return await run_impact_analysis_cycle(ch)
 
 
