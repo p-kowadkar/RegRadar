@@ -1,0 +1,53 @@
+{
+  "company_id": "novapay_demo",
+  "name": "NovaPay",
+  "company_type": "cross_border_neobank_with_treasury_and_bnpl",
+  "annual_volume_usd": 2100000000,
+  "employee_count": 85,
+  "headquarters": "Jersey City, NJ, USA",
+  "founded_year": 2022,
+  "sponsor_bank": "Evolve Bank & Trust",
+  "services": [
+    "consumer_checking",
+    "international_remittance",
+    "bnpl_consumer_lending",
+    "treasury_derivatives",
+    "treasury_bond_holdings",
+    "fx_forward_hedging"
+  ],
+  "customer_jurisdictions": [
+    "us_federal",
+    "us_ca",
+    "us_ny",
+    "us_tx",
+    "us_fl",
+    "mx_federal",
+    "in_federal",
+    "ph_federal",
+    "ng_federal"
+  ],
+  "regulators_in_scope": [
+    "SEC", "CFTC", "FINRA", "OCC", "CFPB", "FinCEN",
+    "NYDFS", "CDFPI", "RBI", "BSP"
+  ],
+  "key_treasury_instruments": [
+    "interest_rate_swaps",
+    "treasury_bonds",
+    "fx_forwards",
+    "credit_default_swaps_legacy"
+  ],
+  "approximate_aum_usd": 320000000,
+  "active_customer_count": 47000,
+  "monthly_transaction_volume_usd": 175000000,
+  "compliance_team_size": 4,
+  "engineering_team_size": 22,
+  "demo_context": {
+    "narrative": "NovaPay is a 3-year-old fintech, post-Series B. They operate in 9 jurisdictions, hold derivatives for treasury hedging, originate consumer credit at scale, and don't have the budget for a 20-person compliance team. RegRadar IS their compliance team.",
+    "pain_points": [
+      "Subscribed to 4 regulatory newsletters, none surface impact on their book",
+      "Last quarter, missed a CFPB BNPL guidance update by 11 days -- nearly led to enforcement action",
+      "Quarterly compliance reviews take 2 weeks of senior engineering time",
+      "Cannot answer 'are we compliant?' on demand without firing off 6 emails"
+    ]
+  }
+}

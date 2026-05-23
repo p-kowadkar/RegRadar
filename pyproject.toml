@@ -1,0 +1,50 @@
+[project]
+name = "regradar"
+version = "0.1.0"
+description = "Agentic Governance & Compliance Intelligence for Fintechs"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "RegRadar Team" }]
+license = { text = "MIT" }
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = ["frontend", "seed/portfolios/*.parquet"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "F",    # pyflakes
+    "I",    # isort
+    "B",    # flake8-bugbear
+    "C4",   # flake8-comprehensions
+    "UP",   # pyupgrade
+    "TID",  # tidy-imports
+    "RUF",  # ruff-specific
+]
+ignore = [
+    "E501",   # line too long (we use line-length = 100)
+]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.mypy]
+python_version = "3.11"
+strict = false                  # gradually tighten
+ignore_missing_imports = true
+warn_unused_ignores = true
+exclude = ["frontend", "venv"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+    "integration: marks tests requiring real services (deselect with -m 'not integration')",
+    "slow: marks tests >5s",
+]
+
+[tool.coverage.run]
+source = ["backend"]
+omit = ["*/tests/*", "*/scripts/*"]

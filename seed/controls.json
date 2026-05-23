@@ -1,0 +1,100 @@
+[
+  {
+    "control_id": "CTRL-001",
+    "name": "Uncleared Swap Initial Margin Threshold",
+    "description": "All uncleared interest rate swaps must maintain initial margin at or above the CFTC-mandated threshold. Breach triggers required action within deadline.",
+    "related_regulation_id": "cftc_margin_rule_2024",
+    "threshold_value": 0.06,
+    "threshold_unit": "pct",
+    "threshold_comparison": "gte",
+    "owner_team": "Treasury Risk",
+    "test_frequency": "daily",
+    "status": "PASSING",
+    "demo_significance": "This is the control that flips during the CFTC margin amendment demo."
+  },
+  {
+    "control_id": "CTRL-002",
+    "name": "BNPL Late Fee Disclosure Compliance",
+    "description": "All BNPL late fees must be disclosed in customer agreements per CFPB guidance. Disclosure must include calculation method and maximum amount.",
+    "related_regulation_id": "cfpb_bnpl_guidance_2024",
+    "threshold_value": 1.0,
+    "threshold_unit": "fraction",
+    "threshold_comparison": "gte",
+    "owner_team": "Consumer Compliance",
+    "test_frequency": "monthly",
+    "status": "PASSING"
+  },
+  {
+    "control_id": "CTRL-003",
+    "name": "SAR Filing Timeliness",
+    "description": "Suspicious Activity Reports must be filed with FinCEN within 30 calendar days of initial detection. Backlog older than 25 days warrants action.",
+    "related_regulation_id": "fincen_sar_filing_rule",
+    "threshold_value": 25,
+    "threshold_unit": "days",
+    "threshold_comparison": "lt",
+    "owner_team": "AML/BSA",
+    "test_frequency": "daily",
+    "status": "PASSING"
+  },
+  {
+    "control_id": "CTRL-004",
+    "name": "OFAC Sanctions Screening Coverage",
+    "description": "All counterparties and customer beneficial owners screened against current OFAC SDN list at least once per business day.",
+    "related_regulation_id": "ofac_sdn_screening_requirement",
+    "threshold_value": 1.0,
+    "threshold_unit": "fraction",
+    "threshold_comparison": "gte",
+    "owner_team": "AML/BSA",
+    "test_frequency": "daily",
+    "status": "PASSING"
+  },
+  {
+    "control_id": "CTRL-005",
+    "name": "Material Cyber Incident Disclosure (SEC)",
+    "description": "Material cybersecurity incidents disclosed via Form 8-K Item 1.05 within 4 business days of materiality determination.",
+    "related_regulation_id": "sec_cyber_disclosure_2023",
+    "threshold_value": 4,
+    "threshold_unit": "business_days",
+    "threshold_comparison": "lte",
+    "owner_team": "Legal & Cybersecurity",
+    "test_frequency": "incident_based",
+    "status": "PASSING"
+  },
+  {
+    "control_id": "CTRL-006",
+    "name": "Customer Identification Program (CIP) Coverage",
+    "description": "All new customer onboardings must complete CIP within 30 days of account opening. Documentation must be verified and retained.",
+    "related_regulation_id": "bsa_cip_requirements",
+    "threshold_value": 30,
+    "threshold_unit": "days",
+    "threshold_comparison": "lt",
+    "owner_team": "Customer Operations",
+    "test_frequency": "weekly",
+    "status": "PASSING"
+  },
+  {
+    "control_id": "CTRL-007",
+    "name": "Reg E Provisional Credit Timing",
+    "description": "When customer disputes a transaction under Reg E, provisional credit must be issued within 10 business days if investigation incomplete.",
+    "related_regulation_id": "reg_e_dispute_resolution",
+    "threshold_value": 10,
+    "threshold_unit": "business_days",
+    "threshold_comparison": "lte",
+    "owner_team": "Customer Operations",
+    "test_frequency": "weekly",
+    "status": "WARNING",
+    "warning_reason": "2 disputes currently at day 8 -- watching"
+  },
+  {
+    "control_id": "CTRL-008",
+    "name": "Cross-Border Wire Reporting (CTR + Form 105)",
+    "description": "Currency transactions above $10K reported via CTR. International wire transfers >$10K also require Form 105 filing with US Customs.",
+    "related_regulation_id": "bsa_ctr_form_105",
+    "threshold_value": 10000,
+    "threshold_unit": "usd",
+    "threshold_comparison": "lte",
+    "owner_team": "AML/BSA",
+    "test_frequency": "daily",
+    "status": "PASSING"
+  }
+]
