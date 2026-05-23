@@ -236,9 +236,13 @@ async def fetch_regulation_text(
     source_url: str,
 ) -> str:
     """Scrape the regulation text from the source URL using Nimble (or Firecrawl fallback)."""
-    nimble = NimbleClient.get()
-    doc = await nimble.scrape_url(url=source_url, parsing_type="markdown")
-    return doc.content
+    from backend.integrations import nimble, firecrawl
+    from backend.integrations.nimble import NimbleError
+    try:
+        doc = await nimble.scrape_url(url=source_url)
+    except NimbleError:
+        doc = await firecrawl.scrape_url(url=source_url)
+    return doc.content_markdown
 
 
 @policy_crawler.tool
@@ -252,13 +256,13 @@ async def search_related_guidance(
     Uses Nimble's grounded search for higher-quality results. Returns a list of
     excerpts that may help disambiguate the section's requirements.
     """
-    nimble = NimbleClient.get()
+    from backend.integrations import nimble
     results = await nimble.search(
         query=f"{regulator} {section} interpretation guidance",
         num_results=5,
-        deep_search=True,
+        use_answer=False,
     )
-    return [r.content[:2000] for r in results]
+    return [r.snippet[:2000] for r in results]
 
 
 async def run_crawler(input: PolicyCrawlInput) -> PolicyExtractionResult:

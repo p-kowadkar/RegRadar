@@ -1,390 +1,310 @@
 """
-Policy Crawler — three skills in sequence, scheduled hourly.
+Policy Crawler — scheduled hourly, verifies compliance control parameters
+against live regulatory text and writes detected changes to ClickHouse.
 
-Skill 1: URL Scanner        — Nimble agent fetches raw regulatory text
-Skill 2: Condition Extractor — Gemini 2.5-flash extracts structured compliance conditions (1 LLM call)
-Skill 3: DB Writer          — updates regradar.regulations + writes regradar.policy_changes
-
-Live ClickHouse schema (cloud):
-  regulations   — one row per control; reg_code links URL manifest to DB rows
-  policy_changes — one row per detected change; triggers Impact Analysis Agent
-
-Embeddings skipped for now (no target table in cloud schema).
+Architecture:
+  1. Load regulation record from regradar.regulations
+  2. Fetch source URL from latest policy_changes row (fallback to hardcoded map)
+  3. Scrape via Nimble → Firecrawl fallback (content < 200 chars = treat as failure)
+  4. One Pydantic AI / Gemini 3.5 Flash call to verify thresholds against scraped text
+  5. Write one policy_changes row; UPDATE regulations.last_crawled_at + version
 """
 
 from __future__ import annotations
 
 import asyncio
 import hashlib
-import html
-import json
-import os
-import re
 import uuid
-from datetime import datetime, timezone
-from html.parser import HTMLParser
-from typing import Generator
+from typing import Literal
 
-import clickhouse_connect
-import httpx
-from google import genai
-from google.genai import types as genai_types
-from nimble_python import Nimble
+from pydantic import BaseModel
+from pydantic_ai import Agent
 
-from backend.utils.env import get as env_get
+from backend.agents.base import AGENT_POLICY_CRAWLER, agent_run_context
+from backend.integrations.clickhouse_client import get_client
+from backend.integrations.vertex_ai import vertex_model
 from backend.utils.logging import get_logger
 
 log = get_logger(__name__)
 
-NIMBLE_AGENT_ID = "regulatory_policy_scraper_2026_05_23_hzyy7i76"
 
-# Maps embedding_key → reg_code stored in regradar.regulations
-URL_MANIFEST: list[dict] = [
-    {
-        "embedding_key": "REG-Z-1026-9G",
-        "reg_code": "Reg Z 1026.9(g)",
-        "url": "https://www.ecfr.gov/current/title-12/chapter-X/part-1026/section-1026.9",
-        "fallback_url": "https://www.consumerfinance.gov/rules-policy/regulations/1026/9/",
-        "section": "1026.9(g)",
-        "source": "eCFR",
-    },
-    {
-        "embedding_key": "REG-Z-1026-13",
-        "reg_code": "Reg Z 1026.13",
-        "url": "https://www.ecfr.gov/current/title-12/chapter-X/part-1026/section-1026.13",
-        "fallback_url": "https://www.consumerfinance.gov/rules-policy/regulations/1026/13/",
-        "section": "1026.13",
-        "source": "eCFR",
-    },
-    {
-        "embedding_key": "FCRA-605",
-        "reg_code": "FCRA Section 605",
-        "url": "https://www.law.cornell.edu/uscode/text/15/1681c",
-        "fallback_url": "https://uscode.house.gov/view.xhtml?req=granuleid:USC-prelim-title15-section1681c",
-        "section": "Section 605",
-        "source": "Cornell LII",
-    },
-    {
-        "embedding_key": "FCRA-623A",
-        "reg_code": "FCRA Section 623(a)",
-        "url": "https://www.law.cornell.edu/uscode/text/15/1681s-2",
-        "fallback_url": "https://uscode.house.gov/view.xhtml?req=granuleid:USC-prelim-title15-section1681s-2",
-        "section": "Section 623(a)",
-        "source": "Cornell LII",
-    },
-]
+# ════════════════════════════════════════════════════════════════
+# Fallback source URL map (used when no policy_changes row exists)
+# ════════════════════════════════════════════════════════════════
+
+_FALLBACK_URLS: dict[str, str] = {
+    "REG-001": "https://www.ecfr.gov/current/title-12/chapter-X/part-1026/section-1026.9",
+    "REG-002": "https://www.ecfr.gov/current/title-12/chapter-X/part-1026/section-1026.9",
+    "REG-003": "https://www.ecfr.gov/current/title-12/chapter-X/part-1026/section-1026.13",
+    "REG-004": "https://www.ecfr.gov/current/title-12/chapter-X/part-1026/section-1026.13",
+    "REG-005": "https://www.law.cornell.edu/uscode/text/15/1681c",
+    "REG-006": "https://www.law.cornell.edu/uscode/text/15/1681s-2",
+    "REG-007": "https://www.law.cornell.edu/uscode/text/15/1681s-2",
+}
 
 
-# ─── ClickHouse client ────────────────────────────────────────────────────────
-
-def get_ch_client():
-    return clickhouse_connect.get_client(
-        host=env_get("CLICKHOUSE_HOST"),
-        port=int(env_get("CLICKHOUSE_PORT", "8443")),
-        username=env_get("CLICKHOUSE_USER", "default"),
-        password=env_get("CLICKHOUSE_PASSWORD", ""),
-        secure=env_get("CLICKHOUSE_SECURE", "true").lower() == "true",
-        database=env_get("CLICKHOUSE_DATABASE", "regradar"),
-    )
+# ════════════════════════════════════════════════════════════════
+# Pydantic models
+# ════════════════════════════════════════════════════════════════
 
 
-# ─── Skill 1: URL Scanner (Nimble agent + httpx fallback) ────────────────────
-
-class _TextStripper(HTMLParser):
-    """Minimal HTML → plain text stripper using stdlib only."""
-    def __init__(self):
-        super().__init__()
-        self._parts: list[str] = []
-        self._skip = False
-
-    def handle_starttag(self, tag, attrs):
-        if tag in ("script", "style", "nav", "header", "footer"):
-            self._skip = True
-
-    def handle_endtag(self, tag):
-        if tag in ("script", "style", "nav", "header", "footer"):
-            self._skip = False
-
-    def handle_data(self, data):
-        if not self._skip:
-            self._parts.append(data)
-
-    def get_text(self) -> str:
-        raw = " ".join(self._parts)
-        raw = html.unescape(raw)
-        return re.sub(r"\s{2,}", " ", raw).strip()
+class RegulationRecord(BaseModel):
+    regulation_id: str
+    act: str
+    reg_code: str
+    control_name: str
+    threshold_days: int | None
+    threshold_label: str
+    trigger_type: str
+    version: str
+    source_url: str
 
 
-def _httpx_scrape(url: str) -> str:
-    """Direct HTTP fetch + HTML strip. Used when Nimble agent returns no text."""
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; RegRadar/1.0)"}
-    resp = httpx.get(url, headers=headers, timeout=30, follow_redirects=True)
-    resp.raise_for_status()
-    stripper = _TextStripper()
-    stripper.feed(resp.text)
-    return stripper.get_text()
+class PolicyCrawlInput(BaseModel):
+    regulation: RegulationRecord
+    scraped_text: str
 
 
-def _nimble_scrape(url: str) -> dict:
-    """
-    Try Nimble agent first (structured parsing). Falls back to direct httpx
-    fetch + HTML strip when the agent returns no text (agent is URL-specific).
-    """
-    nimble = Nimble(api_key=env_get("NIMBLE_API_KEY"))
-    result = nimble.agent.run(agent=NIMBLE_AGENT_ID, params={"url": url})
-    parsing = result.data.parsing or {}
-    text = (
-        parsing.get("full_text")
-        or parsing.get("text")
-        or result.data.markdown
-        or ""
-    )
-    if not text:
-        log.info("nimble.agent_empty_falling_back_to_httpx", url=url)
-        text = _httpx_scrape(url)
-
-    # eCFR pages render via JS — httpx gets a skeleton (<2000 chars is unusable)
-    if len(text) < 2000:
-        raise ValueError(f"Insufficient text ({len(text)} chars) from {url} — will try fallback URL")
-
-    return {
-        "text": text,
-        "content_hash": hashlib.sha256(text.encode()).hexdigest(),
-        "scraped_at": datetime.now(timezone.utc).isoformat(),
-    }
+class CrawlVerification(BaseModel):
+    threshold_days_confirmed: int | None
+    threshold_label_confirmed: str
+    control_name_confirmed: str
+    is_material_change: bool
+    change_summary: str
+    change_type: Literal[
+        "no_change", "threshold_change", "scope_expansion", "clarification", "content_update"
+    ]
+    new_version: str
+    relevant_excerpt: str
 
 
-async def scrape_url(url: str) -> dict:
-    """Async wrapper — runs the blocking Nimble call in a thread."""
-    return await asyncio.to_thread(_nimble_scrape, url)
+# ════════════════════════════════════════════════════════════════
+# Agent
+# ════════════════════════════════════════════════════════════════
+
+_SYSTEM_PROMPT = """\
+You are the Policy Crawler agent for RegRadar, a compliance monitoring system for
+consumer credit card issuers. Your job is to verify compliance control parameters
+against actual regulatory text.
+
+You receive: a regulation record (the current control definition in our database)
+and the scraped text from the official regulation source.
+
+You must find the specific section of text that governs the control and verify:
+1. The exact threshold (days, amount, or boolean requirement)
+2. The exact triggering condition
+3. Whether the current database values match what the regulation actually says
+
+Rules:
+- ONLY extract what the text explicitly states. Never invent thresholds.
+- If the text does not contain the relevant section, set change_summary to
+  "Source text did not contain the relevant section" and change_type to "content_update".
+- If threshold_days is null in the current record, only set threshold_days_confirmed
+  to a number if the text gives an explicit numeric deadline.
+- For version: if is_material_change=True bump the patch version (e.g. "4.0" -> "4.1"),
+  otherwise return the same version string unchanged.
+- Keep change_summary under 200 characters. Be specific: name the section and the value.
+- NEVER hallucinate a regulation citation or dollar amount.
+"""
+
+crawler_agent = Agent(
+    model=vertex_model("gemini-3.5-flash"),
+    input_type=PolicyCrawlInput,
+    output_type=CrawlVerification,
+    system_prompt=_SYSTEM_PROMPT,
+)
 
 
-async def scrape_with_fallback(entry: dict) -> dict:
-    """Try primary URL; fall back to secondary on any failure."""
-    try:
-        result = await scrape_url(entry["url"])
-        result["url_used"] = entry["url"]
-    except Exception as exc:
-        log.warning("nimble.primary_failed", url=entry["url"], error=str(exc))
-        result = await scrape_url(entry["fallback_url"])
-        result["url_used"] = entry["fallback_url"]
-    result.update(entry)
-    return result
+# ════════════════════════════════════════════════════════════════
+# Helpers
+# ════════════════════════════════════════════════════════════════
 
 
-# ─── Change detection ─────────────────────────────────────────────────────────
-
-def get_regulation_ids_for_reg_code(reg_code: str, ch) -> list[str]:
-    """Return all regulation_ids (e.g. REG-001, REG-002) for a given reg_code."""
-    result = ch.query(
-        "SELECT regulation_id FROM regradar.regulations WHERE reg_code = {reg_code:String}",
-        parameters={"reg_code": reg_code},
-    )
-    return [row[0] for row in result.result_rows]
-
-
-def get_last_content_hash(regulation_id: str, ch) -> str | None:
-    """Return the most recently stored content hash from policy_changes, or None."""
-    result = ch.query(
-        "SELECT new_version FROM regradar.policy_changes "
-        "WHERE regulation_id = {rid:String} "
+async def _get_source_url(client, regulation_id: str) -> str:
+    """Return source_url from the most recent policy_changes row; fallback to hardcoded map."""
+    rows = (await client.query(
+        "SELECT source_url FROM regradar.policy_changes "
+        "WHERE regulation_id = {reg_id:String} "
         "ORDER BY detected_at DESC LIMIT 1",
-        parameters={"rid": regulation_id},
-    )
-    rows = result.result_rows
-    return rows[0][0] if rows else None
+        parameters={"reg_id": regulation_id},
+    )).named_results()
+    if rows and rows[0].get("source_url"):
+        return rows[0]["source_url"]
+    url = _FALLBACK_URLS.get(regulation_id)
+    if not url:
+        raise ValueError(f"No source URL found for {regulation_id}")
+    return url
 
 
-def has_changed(reg_code: str, new_hash: str, ch) -> bool:
-    """Return True if content hash differs from last stored version for any row in this reg_code."""
-    regulation_ids = get_regulation_ids_for_reg_code(reg_code, ch)
-    if not regulation_ids:
-        return True
-    last_hash = get_last_content_hash(regulation_ids[0], ch)
-    return last_hash != new_hash
+async def _scrape_regulation(source_url: str) -> str:
+    """Scrape via Nimble; fall back to Firecrawl if content is empty or too short."""
+    from backend.integrations import nimble, firecrawl
+    from backend.integrations.nimble import NimbleError
+
+    try:
+        doc = await nimble.scrape_url(url=source_url)
+        if len(doc.content_markdown.strip()) < 200:
+            raise NimbleError("Content too short, likely blocked")
+        return doc.content_markdown
+    except NimbleError as e:
+        log.warning(
+            "crawler.nimble_fallback",
+            url=source_url,
+            reason=str(e),
+        )
+        doc = await firecrawl.scrape_url(url=source_url)
+        return doc.content_markdown
 
 
-# ─── Skill 2: Condition Extractor (Gemini 2.5-flash) ─────────────────────────
-
-_EXTRACTION_SYSTEM_PROMPT = """
-You are a regulatory compliance engineer. Your job is to read raw regulatory
-text and extract precise, machine-executable compliance conditions.
-
-You must return valid JSON only. No preamble, no markdown, no explanation.
-
-For each compliance control in the text, extract:
-- control_id: short snake_case identifier
-- description: one sentence plain English
-- trigger_type: one of [behavior, schema_change, time_based]
-- trigger_field: the account field that triggers this check
-- trigger_value: the value or condition that fires the trigger
-- compliance_conditions: array of {field, operator, value, unit}
-- account_scope: array of account types this applies to
-- threshold_days: integer if time-based, null otherwise
-- sql_condition: the WHERE clause that identifies non-compliant accounts
-- controls_covered: array of control names this embedding covers
-"""
-
-_EXTRACTION_USER_TEMPLATE = """
-Regulation: {regulation_name}
-Section: {section}
-Embedding key: {embedding_key}
-
-Raw regulatory text:
----
-{raw_text}
----
-
-Extract all compliance controls. Map to fields in this credit card account schema:
-- account_id, account_type, state
-- days_past_due, payment_status
-- penalty_rate_applied, penalty_notice_sent_date, rate_change_date
-- promo_rate_end_date, promo_notice_sent_date
-- dispute_filed, dispute_filed_date, dispute_acknowledged_date, dispute_resolved_date
-- bureau_reported_status, bureau_dispute_flag
-- original_delinquency_date, charged_off, bureau_still_reporting
-- applicable_policies (Array of strings)
-
-Return JSON matching this schema:
-{{
-  "regulation_id": string,
-  "regulation_name": string,
-  "section": string,
-  "embedding_key": string,
-  "version_date": string (ISO date),
-  "controls": [
-    {{
-      "control_id": string,
-      "description": string,
-      "trigger_type": "behavior" | "schema_change" | "time_based",
-      "trigger_field": string,
-      "trigger_value": string,
-      "compliance_conditions": [
-        {{ "field": string, "operator": string, "value": string, "unit": string | null }}
-      ],
-      "account_scope": [string],
-      "threshold_days": integer | null,
-      "sql_condition": string,
-      "controls_covered": [string]
-    }}
-  ]
-}}
-"""
-
-
-def extract_compliance_conditions(scraped: dict) -> dict:
-    """One LLM call per regulation section. Returns structured compliance conditions."""
-    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("DEEPMIND_API_KEY", "")
-    client = genai.Client(api_key=api_key)
-    prompt = _EXTRACTION_USER_TEMPLATE.format(
-        regulation_name=scraped["reg_code"],
-        section=scraped["section"],
-        embedding_key=scraped["embedding_key"],
-        raw_text=scraped["text"][:8000],
-    )
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=prompt,
-        config=genai_types.GenerateContentConfig(
-            system_instruction=_EXTRACTION_SYSTEM_PROMPT,
-            response_mime_type="application/json",
-            temperature=0,
-        ),
-    )
-    return json.loads(response.text)
-
-
-# ─── Skill 3: DB Writer ───────────────────────────────────────────────────────
-
-def update_last_crawled(reg_code: str, ch) -> None:
-    """Stamp last_crawled_at on every regulation row for this reg_code."""
-    ch.command(
-        "ALTER TABLE regradar.regulations UPDATE last_crawled_at = {now:DateTime} "
-        "WHERE reg_code = {reg_code:String}",
-        parameters={
-            "now": datetime.now(timezone.utc).replace(tzinfo=None),
-            "reg_code": reg_code,
-        },
-    )
-
-
-def write_policy_changes(
-    reg_code: str,
-    new_hash: str,
+async def _write_policy_change(
+    client,
+    regulation_id: str,
+    prior_version: str,
+    verification: CrawlVerification,
     source_url: str,
-    conditions: dict,
-    ch,
 ) -> None:
-    """Insert one policy_changes row per regulation_id covered by this reg_code."""
-    regulation_ids = get_regulation_ids_for_reg_code(reg_code, ch)
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
-    rows = []
-    for regulation_id in regulation_ids:
-        prior_hash = get_last_content_hash(regulation_id, ch) or ""
-        rows.append([
-            str(uuid.uuid4()),   # change_id
-            regulation_id,       # regulation_id
-            now,                 # detected_at
-            "content_update" if prior_hash else "initial_ingest",  # change_type
-            prior_hash,          # prior_version
-            new_hash,            # new_version (content hash)
-            f"Policy crawled — {len(conditions.get('controls', []))} controls extracted",  # change_summary
-            True,                # material
-            "",                  # impact_asset_ids
-            "",                  # impact_report_id
-            source_url,          # source_url
-        ])
+    """INSERT one row into regradar.policy_changes and UPDATE regulations."""
+    content_hash = hashlib.sha256(verification.relevant_excerpt.encode()).hexdigest()
 
-    ch.insert(
+    await client.insert(
         "regradar.policy_changes",
-        rows,
+        [[
+            str(uuid.uuid4()),              # change_id
+            regulation_id,                  # regulation_id
+            verification.change_type,       # change_type
+            prior_version,                  # prior_version
+            content_hash,                   # new_version (hash of excerpt)
+            verification.change_summary,    # change_summary
+            verification.is_material_change,  # material
+            "",                             # impact_asset_ids
+            "",                             # impact_report_id
+            source_url,                     # source_url
+        ]],
         column_names=[
-            "change_id", "regulation_id", "detected_at", "change_type",
-            "prior_version", "new_version", "change_summary", "material",
-            "impact_asset_ids", "impact_report_id", "source_url",
+            "change_id", "regulation_id", "change_type", "prior_version",
+            "new_version", "change_summary", "material", "impact_asset_ids",
+            "impact_report_id", "source_url",
         ],
     )
 
+    # Stamp last_crawled_at and bump version on the regulations row.
+    # SharedMergeTree (ClickHouse Cloud) supports mutations via ALTER UPDATE.
+    await client.command(
+        "ALTER TABLE regradar.regulations UPDATE "
+        "last_crawled_at = now(), version = {ver:String} "
+        "WHERE regulation_id = {reg_id:String}",
+        parameters={"ver": verification.new_version, "reg_id": regulation_id},
+    )
 
-# ─── Composed crawler ─────────────────────────────────────────────────────────
 
-async def run_policy_crawler(clickhouse_client=None) -> None:
-    """Entry point. Pass an existing ClickHouse client or one is created from env."""
-    ch = clickhouse_client or get_ch_client()
+# ════════════════════════════════════════════════════════════════
+# Public API
+# ════════════════════════════════════════════════════════════════
 
-    for entry in URL_MANIFEST:
-        log.info("crawler.scraping", reg_code=entry["reg_code"])
-        scraped = await scrape_with_fallback(entry)
 
-        # Always stamp last_crawled_at
-        update_last_crawled(entry["reg_code"], ch)
+async def crawl_one(regulation_id: str) -> CrawlVerification | None:
+    """Crawl a single regulation. Returns None if scraping failed entirely."""
+    async with agent_run_context(agent_id=AGENT_POLICY_CRAWLER, trigger_id=regulation_id):
+        client = await get_client()
 
-        if not has_changed(entry["reg_code"], scraped["content_hash"], ch):
-            log.info("crawler.no_change", reg_code=entry["reg_code"])
-            continue
+        # 1. Load regulation record
+        rows = (await client.query(
+            "SELECT regulation_id, act, reg_code, control_name, threshold_days, "
+            "threshold_label, trigger_type, version "
+            "FROM regradar.regulations WHERE regulation_id = {reg_id:String}",
+            parameters={"reg_id": regulation_id},
+        )).named_results()
+        if not rows:
+            log.error("crawler.regulation_not_found", regulation_id=regulation_id)
+            return None
+        row = rows[0]
 
-        log.info("crawler.change_detected", reg_code=entry["reg_code"])
+        # 2. Resolve source URL
+        source_url = await _get_source_url(client, regulation_id)
 
-        # One LLM call to extract compliance conditions
-        conditions = extract_compliance_conditions(scraped)
+        # 3. Scrape (Nimble → Firecrawl)
+        try:
+            text = await _scrape_regulation(source_url)
+        except Exception as e:
+            log.error("crawler.scrape_failed", regulation_id=regulation_id, error=str(e))
+            await _write_policy_change(
+                client,
+                regulation_id,
+                row["version"],
+                CrawlVerification(
+                    threshold_days_confirmed=row["threshold_days"],
+                    threshold_label_confirmed=row["threshold_label"],
+                    control_name_confirmed=row["control_name"],
+                    is_material_change=False,
+                    change_summary="Scrape failed — source URL unreachable",
+                    change_type="content_update",
+                    new_version=row["version"],
+                    relevant_excerpt="",
+                ),
+                source_url,
+            )
+            return None
 
-        # Write policy_changes for each regulation_id covered by this reg_code
-        write_policy_changes(
-            entry["reg_code"],
-            scraped["content_hash"],
-            scraped["url_used"],
-            conditions,
-            ch,
+        # 4. LLM verification
+        reg_record = RegulationRecord(
+            regulation_id=regulation_id,
+            act=row["act"],
+            reg_code=row["reg_code"],
+            control_name=row["control_name"],
+            threshold_days=row["threshold_days"],
+            threshold_label=row["threshold_label"],
+            trigger_type=row["trigger_type"],
+            version=row["version"],
+            source_url=source_url,
         )
+        result = await crawler_agent.run(
+            PolicyCrawlInput(regulation=reg_record, scraped_text=text[:8000])
+        )
+        verification = result.output
 
-        regulation_ids = get_regulation_ids_for_reg_code(entry["reg_code"], ch)
+        # 5. Write policy_change row + update regulations
+        await _write_policy_change(client, regulation_id, row["version"], verification, source_url)
+
         log.info(
-            "crawler.stored",
-            reg_code=entry["reg_code"],
-            regulation_ids=regulation_ids,
-            controls=len(conditions.get("controls", [])),
+            "crawler.regulation_done",
+            regulation_id=regulation_id,
+            material=verification.is_material_change,
+            change_type=verification.change_type,
+            summary=verification.change_summary,
         )
+        return verification
 
 
-if __name__ == "__main__":
-    asyncio.run(run_policy_crawler())
+async def crawl_all() -> dict[str, CrawlVerification | None]:
+    """Crawl all 7 regulations sequentially. Returns dict of regulation_id -> result."""
+    client = await get_client()
+    rows = (await client.query(
+        "SELECT regulation_id FROM regradar.regulations ORDER BY regulation_id",
+    )).named_results()
+    reg_ids = [r["regulation_id"] for r in rows]
+
+    results: dict[str, CrawlVerification | None] = {}
+    for reg_id in reg_ids:
+        results[reg_id] = await crawl_one(reg_id)
+        await asyncio.sleep(1)
+    return results
+
+
+async def policy_crawler_loop() -> None:
+    """Scheduled hourly loop. Called from backend/main.py lifespan."""
+    log.info("crawler.loop_started", interval_seconds=3600)
+    while True:
+        log.info("crawler.cycle_start")
+        try:
+            results = await crawl_all()
+            material_count = sum(
+                1 for v in results.values() if v and v.is_material_change
+            )
+            log.info(
+                "crawler.cycle_done",
+                total=len(results),
+                material_changes=material_count,
+            )
+        except Exception as e:
+            log.error("crawler.cycle_failed", error=str(e))
+        await asyncio.sleep(3600)

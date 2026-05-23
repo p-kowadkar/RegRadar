@@ -695,7 +695,7 @@ async def scrape_with_failover(url: str):
 pip install "ddtrace>=4.8.0"
 ```
 
-The 4.8+ requirement is critical -- it auto-instruments both `pydantic-ai>=1.63` AND `google-genai>=2.0`. Older versions (2.x, 3.x) instrument `google-genai` but miss Pydantic AI tool calls.
+The 4.8+ requirement is critical -- it auto-instruments both `pydantic-ai>=1.85` AND `google-genai>=2.0`. Older versions (2.x, 3.x) instrument `google-genai` but miss Pydantic AI tool calls.
 
 ### Environment Variables
 

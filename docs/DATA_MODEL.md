@@ -158,7 +158,7 @@ The 4 policy embeddings. Each regulation gets chunked into ~3-5 embeddings.
 | `regulation_section` | String | Denormalized for filter speed |
 | `chunk_text` | String | The text that was embedded |
 | `chunk_index` | UInt32 | Order within regulation |
-| `embedding` | Array(Float32) | 768-dim from text-embedding-005 |
+| `embedding` | Array(Float32) | 768-dim from gemini-embedding-001 (Matryoshka-truncated from 3072) |
 | `created_at` | DateTime | |
 
 **Engine:** `MergeTree ORDER BY (regulation_id, chunk_index)`

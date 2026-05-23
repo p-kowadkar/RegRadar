@@ -654,9 +654,9 @@ async def main():
 
     print("==> 4. Embedding policy chunks (4 chunks, ~5 seconds)...")
     chunks = json.loads((SEED_DIR / "policy_embeddings.json").read_text())
-    vertex = VertexAIClient.get()
+    from backend.integrations.vertex_ai import embed_text
     for chunk in chunks:
-        embedding = await vertex.embed_text(
+        embedding = await embed_text(
             text=chunk["chunk_text"],
             model="gemini-embedding-001",
             output_dim=768,                 # Matryoshka truncation

@@ -59,16 +59,15 @@ Six testable controls. Four policy embeddings. One ClickHouse store.
 | Frontend | React 18 + TypeScript + Tailwind + Vite | Fast HMR, type safety |
 | State | Zustand + TanStack Query | Server state + WS integration |
 
-**Locked decisions:**
-- No Redis. No Postgres. No separate vector DB. ClickHouse only.
-- No LangChain. Pydantic AI gives us typed agents without the kitchen sink.
-- No auth on the demo. TODO for production.
-- Async everywhere.
-- All env vars validated at startup via `backend/utils/env.py`.
+**Non-deterministic reasoning at exactly five points**, all at the boundary between unstructured regulatory text and structured schema:
 
----
+1. **Policy text → compliance condition** (Policy Crawler)
+2. **Policy diff → material change classification** (Policy Crawler on update)
+3. **Schema field → policy relevance mapping** (Impact Analysis on schema_event)
+4. **Ambiguous account scoping resolution** (Impact Analysis on edge cases)
+5. **Grounding check on every generated claim** (Auditor via Check Grounding API)
 
-## The Four Agents
+Compliance decisions are never made by an embedding similarity score -- only by SQL conditions derived from extracted regulatory text.
 
 ```
                      ┌─────────────────────────────────────┐
@@ -289,7 +288,7 @@ RegRadar/
 
 | Role | Responsibility |
 |---|---|
-| Repo owner | [@shashank1289](https://github.com/shashank1289) |
+| Repo owner | [@p-kowadkar](https://github.com/p-kowadkar) |
 | Team size | 4 |
 
 Hackathon: Agentic Engineering Hack NYC, May 23, 2026, Datadog NYC.

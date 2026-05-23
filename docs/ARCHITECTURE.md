@@ -232,17 +232,15 @@ Safety net. The Monitoring Agent runs all 6 control SQL queries daily regardless
 
 ---
 
-## 4. Where LLM Reasoning Is Applied
-
 The system uses non-deterministic reasoning at **exactly five points**, all at the boundary between unstructured regulatory text and structured schema:
 
 | Point | Agent | LLM | Purpose |
 |---|---|---|---|
-| Policy text → ComplianceCondition | Policy Crawler | Gemini 3.5 Flash | Extract field, operator, threshold from regulation |
-| Policy diff → material change | Policy Crawler (on update) | Gemini 3.5 Flash | Decide if change is material (new threshold/scope) or clarification |
-| Schema field → policy relevance | Impact Analysis | Gemini 3.5 Flash | Map new column to which policies it enables/affects |
-| Ambiguous account scoping | Impact Analysis | Gemini 3.5 Flash | Edge cases (pre-effective-date accounts, partial docs, bankruptcy) |
-| Grounding verification | Auditor | Check Grounding + Gemini 3.1 Pro | Verify every claim and citation in ImpactReport |
+| 1. Policy text → ComplianceCondition | Policy Crawler | Gemini 3.5 Flash | Extract field, operator, threshold from regulation |
+| 2. Policy diff → material change | Policy Crawler (on update) | Gemini 3.5 Flash | Decide if change is material or clarification |
+| 3. Schema field → policy relevance | Impact Analysis | Gemini 3.5 Flash | Map new column to which policies it enables/affects |
+| 4. Ambiguous account scoping | Impact Analysis | Gemini 3.5 Flash | Edge cases (pre-effective-date accounts, partial docs, bankruptcy) |
+| 5. Grounding verification | Auditor | Check Grounding + Gemini 3.1 Pro | Verify every claim and citation in ImpactReport |
 
 **Everything else is deterministic SQL.** Compliance decisions are never made by an embedding similarity score -- only by SQL conditions derived from extracted regulatory text.
 
@@ -475,7 +473,7 @@ When the Auditor approves an ImpactReport, the Senso integration generates a str
 ### Brief schema
 
 ```python
-class CompianceBrief(BaseModel):
+class ComplianceBrief(BaseModel):
     title: str                          # "FCRA Section 605: 1,247 accounts surfaced as stale-data violations"
     handle: str                         # "regradar"
     slug: str                           # "fcra-605-stale-data-2026-05-23"
