@@ -16,13 +16,17 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import html
 import json
 import os
+import re
 import uuid
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 from typing import Generator
 
 import clickhouse_connect
+import httpx
 from google import genai
 from google.genai import types as genai_types
 from nimble_python import Nimble
@@ -84,16 +88,50 @@ def get_ch_client():
     )
 
 
-# ─── Skill 1: URL Scanner (Nimble agent) ─────────────────────────────────────
+# ─── Skill 1: URL Scanner (Nimble agent + httpx fallback) ────────────────────
+
+class _TextStripper(HTMLParser):
+    """Minimal HTML → plain text stripper using stdlib only."""
+    def __init__(self):
+        super().__init__()
+        self._parts: list[str] = []
+        self._skip = False
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("script", "style", "nav", "header", "footer"):
+            self._skip = True
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style", "nav", "header", "footer"):
+            self._skip = False
+
+    def handle_data(self, data):
+        if not self._skip:
+            self._parts.append(data)
+
+    def get_text(self) -> str:
+        raw = " ".join(self._parts)
+        raw = html.unescape(raw)
+        return re.sub(r"\s{2,}", " ", raw).strip()
+
+
+def _httpx_scrape(url: str) -> str:
+    """Direct HTTP fetch + HTML strip. Used when Nimble agent returns no text."""
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; RegRadar/1.0)"}
+    resp = httpx.get(url, headers=headers, timeout=30, follow_redirects=True)
+    resp.raise_for_status()
+    stripper = _TextStripper()
+    stripper.feed(resp.text)
+    return stripper.get_text()
+
 
 def _nimble_scrape(url: str) -> dict:
-    """Synchronous Nimble agent call. Wrapped in asyncio.to_thread by caller."""
+    """
+    Try Nimble agent first (structured parsing). Falls back to direct httpx
+    fetch + HTML strip when the agent returns no text (agent is URL-specific).
+    """
     nimble = Nimble(api_key=env_get("NIMBLE_API_KEY"))
-    result = nimble.agent.run(
-        agent=NIMBLE_AGENT_ID,
-        params={"url": url},
-    )
-    # AgentRunResponse: text lives in result.data.parsing['full_text']
+    result = nimble.agent.run(agent=NIMBLE_AGENT_ID, params={"url": url})
     parsing = result.data.parsing or {}
     text = (
         parsing.get("full_text")
@@ -101,6 +139,14 @@ def _nimble_scrape(url: str) -> dict:
         or result.data.markdown
         or ""
     )
+    if not text:
+        log.info("nimble.agent_empty_falling_back_to_httpx", url=url)
+        text = _httpx_scrape(url)
+
+    # eCFR pages render via JS — httpx gets a skeleton (<2000 chars is unusable)
+    if len(text) < 2000:
+        raise ValueError(f"Insufficient text ({len(text)} chars) from {url} — will try fallback URL")
+
     return {
         "text": text,
         "content_hash": hashlib.sha256(text.encode()).hexdigest(),
