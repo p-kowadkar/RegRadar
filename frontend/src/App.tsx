@@ -99,6 +99,7 @@ export default function App() {
             icon={Activity}
             tone="brand"
             hint="data_assets"
+            source="SELECT count() FROM data_assets"
           />
           <KpiCard
             label="Accounted for"
@@ -106,6 +107,7 @@ export default function App() {
             icon={ShieldCheck}
             tone="ok"
             hint="In scope of a regulation"
+            source="asset_regulation_map.in_scope = true"
           />
           <KpiCard
             label="Out of compliance"
@@ -113,6 +115,7 @@ export default function App() {
             icon={AlertTriangle}
             tone="critical"
             hint="OPEN + IN_REMEDIATION"
+            source="compliance_violations.status IN (OPEN, IN_REMEDIATION)"
           />
           <KpiCard
             label="Suggested fixes"
@@ -120,6 +123,7 @@ export default function App() {
             icon={ListChecks}
             tone="warn"
             hint="Steps for live violations"
+            source="remediation_steps ⨝ violations(OPEN, IN_REMEDIATION)"
           />
           <KpiCard
             label="Fixes completed"
@@ -127,6 +131,7 @@ export default function App() {
             icon={CheckCircle2}
             tone="ok"
             hint="RESOLVED violations"
+            source="compliance_violations.status = RESOLVED"
           />
         </section>
 
@@ -141,7 +146,10 @@ export default function App() {
           </div>
           <div>
             {summary && summary.byPolicy.length > 0 ? (
-              <PolicyBreakdownChart data={summary.byPolicy} />
+              <PolicyBreakdownChart
+                data={summary.byPolicy}
+                regulations={regulations}
+              />
             ) : null}
           </div>
         </section>

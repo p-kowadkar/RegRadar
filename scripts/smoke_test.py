@@ -104,10 +104,10 @@ async def run_smoke_tests(verbose: bool) -> int:
     if os.environ.get("GOOGLE_CLOUD_PROJECT"):
         try:
             from backend.integrations.vertex_ai import vertex_model
-            model = vertex_model("gemini-3.5-flash")
+            model = vertex_model("gemini-2.5-flash")
             results.append((
                 "Vertex AI provider", True,
-                f"model={getattr(model, 'model_name', 'gemini-3.5-flash')}",
+                f"model={getattr(model, 'model_name', 'gemini-2.5-flash')}",
             ))
         except Exception as e:
             results.append(("Vertex AI provider", False, _err(e, verbose)))

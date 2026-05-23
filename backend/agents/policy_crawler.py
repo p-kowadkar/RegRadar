@@ -108,7 +108,7 @@ Rules:
 """
 
 crawler_agent = Agent(
-    model=vertex_model("gemini-3.5-flash"),
+    model=vertex_model("gemini-2.5-flash"),
     output_type=CrawlVerification,
     system_prompt=_SYSTEM_PROMPT,
 )
@@ -121,12 +121,12 @@ crawler_agent = Agent(
 
 async def _get_source_url(client, regulation_id: str) -> str:
     """Return source_url from the most recent policy_changes row; fallback to hardcoded map."""
-    rows = (await client.query(
+    rows = list((await client.query(
         "SELECT source_url FROM regradar.policy_changes "
         "WHERE regulation_id = {reg_id:String} "
         "ORDER BY detected_at DESC LIMIT 1",
         parameters={"reg_id": regulation_id},
-    )).named_results()
+    )).named_results())
     if rows and rows[0].get("source_url"):
         return rows[0]["source_url"]
     url = _FALLBACK_URLS.get(regulation_id)
@@ -207,12 +207,12 @@ async def crawl_one(regulation_id: str) -> CrawlVerification | None:
         client = await get_client()
 
         # 1. Load regulation record
-        rows = (await client.query(
+        rows = list((await client.query(
             "SELECT regulation_id, act, reg_code, control_name, threshold_days, "
             "threshold_label, trigger_type, version "
             "FROM regradar.regulations WHERE regulation_id = {reg_id:String}",
             parameters={"reg_id": regulation_id},
-        )).named_results()
+        )).named_results())
         if not rows:
             log.error("crawler.regulation_not_found", regulation_id=regulation_id)
             return None
@@ -257,7 +257,9 @@ async def crawl_one(regulation_id: str) -> CrawlVerification | None:
             source_url=source_url,
         )
         result = await crawler_agent.run(
-            PolicyCrawlInput(regulation=reg_record, scraped_text=text[:8000])
+            PolicyCrawlInput(
+                regulation=reg_record, scraped_text=text[:8000]
+            ).model_dump_json()
         )
         verification = result.output
 
@@ -277,9 +279,9 @@ async def crawl_one(regulation_id: str) -> CrawlVerification | None:
 async def crawl_all() -> dict[str, CrawlVerification | None]:
     """Crawl all 7 regulations sequentially. Returns dict of regulation_id -> result."""
     client = await get_client()
-    rows = (await client.query(
+    rows = list((await client.query(
         "SELECT regulation_id FROM regradar.regulations ORDER BY regulation_id",
-    )).named_results()
+    )).named_results())
     reg_ids = [r["regulation_id"] for r in rows]
 
     results: dict[str, CrawlVerification | None] = {}
@@ -307,3 +309,17 @@ async def policy_crawler_loop() -> None:
         except Exception as e:
             log.error("crawler.cycle_failed", error=str(e))
         await asyncio.sleep(3600)
+
+
+if __name__ == "__main__":
+    # One-shot crawl across all regulations. Use scheduler.py for the loop.
+    async def _main() -> None:
+        results = await crawl_all()
+        material = sum(1 for v in results.values() if v and v.is_material_change)
+        log.info(
+            "crawler.standalone_done",
+            total=len(results),
+            material_changes=material,
+        )
+
+    asyncio.run(_main())

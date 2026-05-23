@@ -6,6 +6,12 @@ interface KpiCardProps {
   label: string;
   value: number | string;
   hint?: string;
+  /**
+   * Optional one-line provenance caption shown in monospace at the
+   * bottom of the card. Tells the viewer exactly which ClickHouse
+   * column or query the value comes from.
+   */
+  source?: string;
   icon: ComponentType<LucideProps>;
   tone?: "neutral" | "ok" | "warn" | "critical" | "info" | "brand";
 }
@@ -19,7 +25,14 @@ const TONE: Record<NonNullable<KpiCardProps["tone"]>, string> = {
   brand: "text-brand",
 };
 
-export function KpiCard({ label, value, hint, icon: Icon, tone = "neutral" }: KpiCardProps) {
+export function KpiCard({
+  label,
+  value,
+  hint,
+  source,
+  icon: Icon,
+  tone = "neutral",
+}: KpiCardProps) {
   return (
     <Card className="px-4 py-3.5">
       <div className="flex items-center justify-between gap-3">
@@ -32,6 +45,14 @@ export function KpiCard({ label, value, hint, icon: Icon, tone = "neutral" }: Kp
         {value}
       </div>
       {hint && <div className="mt-1 text-xs text-text-muted">{hint}</div>}
+      {source && (
+        <div
+          className="mt-1 truncate font-mono text-[10px] text-text-muted/80"
+          title={source}
+        >
+          {source}
+        </div>
+      )}
     </Card>
   );
 }
