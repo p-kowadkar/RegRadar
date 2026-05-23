@@ -58,3 +58,6 @@ demo-recordings/
 
 # Antigravity
 .antigravity/
+
+# Claude Code local config / memory
+.claude/
