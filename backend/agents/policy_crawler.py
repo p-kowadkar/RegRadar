@@ -3,10 +3,13 @@ Policy Crawler — three skills in sequence, scheduled hourly.
 
 Skill 1: URL Scanner        — Nimble agent fetches raw regulatory text
 Skill 2: Condition Extractor — Gemini 2.5-flash extracts structured compliance conditions (1 LLM call)
-Skill 3: Embedding Generator — text-embedding-004 chunks + stores vectors in ClickHouse
+Skill 3: DB Writer          — updates regradar.regulations + writes regradar.policy_changes
 
-Only fires downstream (Skills 2 & 3) when content hash has changed.
-Writes a policy_changes event on change → triggers the Impact Analysis Agent.
+Live ClickHouse schema (cloud):
+  regulations   — one row per control; reg_code links URL manifest to DB rows
+  policy_changes — one row per detected change; triggers Impact Analysis Agent
+
+Embeddings skipped for now (no target table in cloud schema).
 """
 
 from __future__ import annotations
@@ -15,9 +18,11 @@ import asyncio
 import hashlib
 import json
 import os
+import uuid
 from datetime import datetime, timezone
 from typing import Generator
 
+import clickhouse_connect
 import google.generativeai as genai
 from nimble_python import Nimble
 
@@ -28,10 +33,11 @@ log = get_logger(__name__)
 
 NIMBLE_AGENT_ID = "regulatory_policy_scraper_2026_05_23_hzyy7i76"
 
+# Maps embedding_key → reg_code stored in regradar.regulations
 URL_MANIFEST: list[dict] = [
     {
         "embedding_key": "REG-Z-1026-9G",
-        "regulation_id": "TILA-REG-Z-1026-9-G",
+        "reg_code": "Reg Z 1026.9(g)",
         "url": "https://www.ecfr.gov/current/title-12/chapter-X/part-1026/section-1026.9",
         "fallback_url": "https://www.consumerfinance.gov/rules-policy/regulations/1026/9/",
         "section": "1026.9(g)",
@@ -39,7 +45,7 @@ URL_MANIFEST: list[dict] = [
     },
     {
         "embedding_key": "REG-Z-1026-13",
-        "regulation_id": "TILA-REG-Z-1026-13",
+        "reg_code": "Reg Z 1026.13",
         "url": "https://www.ecfr.gov/current/title-12/chapter-X/part-1026/section-1026.13",
         "fallback_url": "https://www.consumerfinance.gov/rules-policy/regulations/1026/13/",
         "section": "1026.13",
@@ -47,7 +53,7 @@ URL_MANIFEST: list[dict] = [
     },
     {
         "embedding_key": "FCRA-605",
-        "regulation_id": "FCRA-15-USC-1681C",
+        "reg_code": "FCRA Section 605",
         "url": "https://www.law.cornell.edu/uscode/text/15/1681c",
         "fallback_url": "https://uscode.house.gov/view.xhtml?req=granuleid:USC-prelim-title15-section1681c",
         "section": "Section 605",
@@ -55,13 +61,27 @@ URL_MANIFEST: list[dict] = [
     },
     {
         "embedding_key": "FCRA-623A",
-        "regulation_id": "FCRA-15-USC-1681S-2",
+        "reg_code": "FCRA Section 623(a)",
         "url": "https://www.law.cornell.edu/uscode/text/15/1681s-2",
         "fallback_url": "https://uscode.house.gov/view.xhtml?req=granuleid:USC-prelim-title15-section1681s-2",
         "section": "Section 623(a)",
         "source": "Cornell LII",
     },
 ]
+
+
+# ─── ClickHouse client ────────────────────────────────────────────────────────
+
+def get_ch_client():
+    return clickhouse_connect.get_client(
+        host=env_get("CLICKHOUSE_HOST"),
+        port=int(env_get("CLICKHOUSE_PORT", "8443")),
+        username=env_get("CLICKHOUSE_USER", "default"),
+        password=env_get("CLICKHOUSE_PASSWORD", ""),
+        secure=env_get("CLICKHOUSE_SECURE", "true").lower() == "true",
+        database=env_get("CLICKHOUSE_DATABASE", "regradar"),
+    )
+
 
 # ─── Skill 1: URL Scanner (Nimble agent) ─────────────────────────────────────
 
@@ -72,7 +92,6 @@ def _nimble_scrape(url: str) -> dict:
         agent=NIMBLE_AGENT_ID,
         params={"url": url},
     )
-    # result is a dict; extract text from whichever key the agent returns
     text = (
         result.get("text")
         or result.get("content")
@@ -104,17 +123,36 @@ async def scrape_with_fallback(entry: dict) -> dict:
     return result
 
 
-def has_changed(regulation_id: str, new_hash: str, clickhouse_client) -> bool:
-    """Return True if content hash differs from last stored version."""
-    row = clickhouse_client.query(
-        "SELECT content_hash FROM regulatory_documents "
-        "WHERE policy_id = %(rid)s "
-        "ORDER BY published_date DESC LIMIT 1",
-        {"rid": regulation_id},
-    ).first_row
-    if not row:
+# ─── Change detection ─────────────────────────────────────────────────────────
+
+def get_regulation_ids_for_reg_code(reg_code: str, ch) -> list[str]:
+    """Return all regulation_ids (e.g. REG-001, REG-002) for a given reg_code."""
+    result = ch.query(
+        "SELECT regulation_id FROM regradar.regulations WHERE reg_code = {reg_code:String}",
+        parameters={"reg_code": reg_code},
+    )
+    return [row[0] for row in result.result_rows]
+
+
+def get_last_content_hash(regulation_id: str, ch) -> str | None:
+    """Return the most recently stored content hash from policy_changes, or None."""
+    result = ch.query(
+        "SELECT new_version FROM regradar.policy_changes "
+        "WHERE regulation_id = {rid:String} "
+        "ORDER BY detected_at DESC LIMIT 1",
+        parameters={"rid": regulation_id},
+    )
+    rows = result.result_rows
+    return rows[0][0] if rows else None
+
+
+def has_changed(reg_code: str, new_hash: str, ch) -> bool:
+    """Return True if content hash differs from last stored version for any row in this reg_code."""
+    regulation_ids = get_regulation_ids_for_reg_code(reg_code, ch)
+    if not regulation_ids:
         return True
-    return row[0] != new_hash
+    last_hash = get_last_content_hash(regulation_ids[0], ch)
+    return last_hash != new_hash
 
 
 # ─── Skill 2: Condition Extractor (Gemini 2.5-flash) ─────────────────────────
@@ -187,7 +225,8 @@ Return JSON matching this schema:
 
 def extract_compliance_conditions(scraped: dict) -> dict:
     """One LLM call per regulation section. Returns structured compliance conditions."""
-    genai.configure(api_key=env_get("GOOGLE_GENAI_API_KEY", os.environ.get("DEEPMIND_API_KEY", "")))
+    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("DEEPMIND_API_KEY", "")
+    genai.configure(api_key=api_key)
     model = genai.GenerativeModel(
         model_name="gemini-2.5-flash",
         generation_config={
@@ -197,7 +236,7 @@ def extract_compliance_conditions(scraped: dict) -> dict:
         system_instruction=_EXTRACTION_SYSTEM_PROMPT,
     )
     prompt = _EXTRACTION_USER_TEMPLATE.format(
-        regulation_name=scraped["regulation_id"],
+        regulation_name=scraped["reg_code"],
         section=scraped["section"],
         embedding_key=scraped["embedding_key"],
         raw_text=scraped["text"][:8000],
@@ -206,137 +245,95 @@ def extract_compliance_conditions(scraped: dict) -> dict:
     return json.loads(response.text)
 
 
-# ─── Skill 3: Embedding Generator (text-embedding-004) ───────────────────────
+# ─── Skill 3: DB Writer ───────────────────────────────────────────────────────
 
-def chunk_policy_text(
-    text: str,
-    chunk_size: int = 512,
-    overlap: int = 64,
-) -> Generator[str, None, None]:
-    """Split on paragraph boundaries then by token budget."""
-    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
-    current_chunk: list[str] = []
-    current_size = 0
-
-    for para in paragraphs:
-        para_size = len(para.split())
-        if current_size + para_size > chunk_size and current_chunk:
-            yield " ".join(current_chunk)
-            overlap_text = current_chunk[-1] if current_chunk else ""
-            current_chunk = [overlap_text, para]
-            current_size = len(overlap_text.split()) + para_size
-        else:
-            current_chunk.append(para)
-            current_size += para_size
-
-    if current_chunk:
-        yield " ".join(current_chunk)
-
-
-def generate_embedding(text: str) -> list[float]:
-    """Single embedding call. Returns 768-dim vector."""
-    result = genai.embed_content(
-        model="models/text-embedding-004",
-        content=text,
-        task_type="retrieval_document",
-        title="Regulatory policy text",
+def update_last_crawled(reg_code: str, ch) -> None:
+    """Stamp last_crawled_at on every regulation row for this reg_code."""
+    ch.command(
+        "ALTER TABLE regradar.regulations UPDATE last_crawled_at = {now:DateTime} "
+        "WHERE reg_code = {reg_code:String}",
+        parameters={
+            "now": datetime.now(timezone.utc).replace(tzinfo=None),
+            "reg_code": reg_code,
+        },
     )
-    return result["embedding"]
 
 
-def embed_and_store(scraped: dict, conditions: dict, clickhouse_client) -> int:
-    """Chunk policy text, generate embeddings, insert into ClickHouse. Returns chunk count."""
-    chunks = list(chunk_policy_text(scraped["text"]))
+def write_policy_changes(
+    reg_code: str,
+    new_hash: str,
+    source_url: str,
+    conditions: dict,
+    ch,
+) -> None:
+    """Insert one policy_changes row per regulation_id covered by this reg_code."""
+    regulation_ids = get_regulation_ids_for_reg_code(reg_code, ch)
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     rows = []
-    for i, chunk in enumerate(chunks):
-        embedding = generate_embedding(chunk)
-        rows.append({
-            "policy_id":      conditions["regulation_id"],
-            "source":         scraped["source"],
-            "section":        scraped["section"],
-            "chunk_index":    i,
-            "chunk_text":     chunk,
-            "embedding":      embedding,
-            "content_hash":   scraped["content_hash"],
-            "version":        conditions["version_date"],
-            "published_date": datetime.now(timezone.utc),
-        })
-    clickhouse_client.insert("regulatory_documents", rows)
-    return len(rows)
+    for regulation_id in regulation_ids:
+        prior_hash = get_last_content_hash(regulation_id, ch) or ""
+        rows.append([
+            str(uuid.uuid4()),   # change_id
+            regulation_id,       # regulation_id
+            now,                 # detected_at
+            "content_update" if prior_hash else "initial_ingest",  # change_type
+            prior_hash,          # prior_version
+            new_hash,            # new_version (content hash)
+            f"Policy crawled — {len(conditions.get('controls', []))} controls extracted",  # change_summary
+            True,                # material
+            "",                  # impact_asset_ids
+            "",                  # impact_report_id
+            source_url,          # source_url
+        ])
 
-
-# ─── Downstream writes ────────────────────────────────────────────────────────
-
-def store_policy_conditions(conditions: dict, ch) -> None:
-    for control in conditions["controls"]:
-        ch.execute(
-            "INSERT INTO governance_controls "
-            "(control_id, regulation_id, title, description, "
-            " query_template, threshold, owner, frequency, active) VALUES",
-            [{
-                "control_id":     control["control_id"],
-                "regulation_id":  conditions["regulation_id"],
-                "title":          control["description"],
-                "description":    control["description"],
-                "query_template": control["sql_condition"],
-                "threshold":      0,
-                "owner":          "Compliance Team",
-                "frequency":      "daily",
-                "active":         True,
-            }],
-        )
-
-
-def write_policy_change_event(regulation_id: str, conditions: dict, ch) -> None:
-    ch.execute(
-        "INSERT INTO policy_changes "
-        "(policy_id, new_version, change_summary, processed) VALUES",
-        [{
-            "policy_id":      regulation_id,
-            "new_version":    conditions["version_date"],
-            "change_summary": f"Policy updated — {len(conditions['controls'])} controls extracted",
-            "processed":      False,
-        }],
+    ch.insert(
+        "regradar.policy_changes",
+        rows,
+        column_names=[
+            "change_id", "regulation_id", "detected_at", "change_type",
+            "prior_version", "new_version", "change_summary", "material",
+            "impact_asset_ids", "impact_report_id", "source_url",
+        ],
     )
 
 
-# ─── Composed crawler ────────────────────────────────────────────────────────
+# ─── Composed crawler ─────────────────────────────────────────────────────────
 
 async def run_policy_crawler(clickhouse_client=None) -> None:
-    """
-    Entry point. Pass an existing ClickHouse client or one will be created
-    from env vars.
-    """
-    import clickhouse_connect
-
-    ch = clickhouse_client or clickhouse_connect.get_client(
-        host=env_get("CLICKHOUSE_HOST"),
-        port=int(env_get("CLICKHOUSE_PORT", "8123")),
-        username=env_get("CLICKHOUSE_USER"),
-        password=env_get("CLICKHOUSE_PASSWORD", ""),
-        database=env_get("CLICKHOUSE_DATABASE", "regradar"),
-    )
+    """Entry point. Pass an existing ClickHouse client or one is created from env."""
+    ch = clickhouse_client or get_ch_client()
 
     for entry in URL_MANIFEST:
-        log.info("crawler.scraping", regulation_id=entry["regulation_id"])
+        log.info("crawler.scraping", reg_code=entry["reg_code"])
         scraped = await scrape_with_fallback(entry)
 
-        if not has_changed(entry["regulation_id"], scraped["content_hash"], ch):
-            log.info("crawler.no_change", regulation_id=entry["regulation_id"])
+        # Always stamp last_crawled_at
+        update_last_crawled(entry["reg_code"], ch)
+
+        if not has_changed(entry["reg_code"], scraped["content_hash"], ch):
+            log.info("crawler.no_change", reg_code=entry["reg_code"])
             continue
 
-        log.info("crawler.change_detected", regulation_id=entry["regulation_id"])
+        log.info("crawler.change_detected", reg_code=entry["reg_code"])
 
+        # One LLM call to extract compliance conditions
         conditions = extract_compliance_conditions(scraped)
-        chunk_count = embed_and_store(scraped, conditions, ch)
-        store_policy_conditions(conditions, ch)
-        write_policy_change_event(entry["regulation_id"], conditions, ch)
 
+        # Write policy_changes for each regulation_id covered by this reg_code
+        write_policy_changes(
+            entry["reg_code"],
+            scraped["content_hash"],
+            scraped["url_used"],
+            conditions,
+            ch,
+        )
+
+        regulation_ids = get_regulation_ids_for_reg_code(entry["reg_code"], ch)
         log.info(
             "crawler.stored",
-            regulation_id=entry["regulation_id"],
-            chunks=chunk_count,
-            controls=len(conditions["controls"]),
+            reg_code=entry["reg_code"],
+            regulation_ids=regulation_ids,
+            controls=len(conditions.get("controls", [])),
         )
 
 
