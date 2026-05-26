@@ -22,15 +22,15 @@ RUN pip install --no-cache-dir --user -r requirements.txt
 COPY --chown=user backend/ ./backend/
 COPY --chown=user seed/ ./seed/
 
-# HF Spaces default port
+# Default to HF Spaces' 7860; DO App Platform sets $PORT=8080 at runtime,
+# Railway/Fly.io set their own. Shell-form CMD expands the variable.
 ENV PORT=7860 \
-    APP_PORT=7860 \
     PYTHONUNBUFFERED=1
 
 EXPOSE 7860
 
 # Lightweight health endpoint at GET /health
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD curl -fsS http://127.0.0.1:7860/health || exit 1
+    CMD curl -fsS "http://127.0.0.1:${PORT:-7860}/health" || exit 1
 
-CMD ["python", "-m", "uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "7860"]
+CMD python -m uvicorn backend.main:app --host 0.0.0.0 --port ${PORT:-7860}

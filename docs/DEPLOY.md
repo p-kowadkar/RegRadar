@@ -28,9 +28,11 @@ Architecture:
 ## Table of contents
 
 1. [Prerequisites](#1-prerequisites)
-2. [Deploy the backend to Hugging Face Spaces](#2-deploy-the-backend-to-hugging-face-spaces)
+2. [Deploy the backend — pick one host](#2-deploy-the-backend--pick-one-host)
+   - 2a. [Hugging Face Spaces](#2a-hugging-face-spaces-free) (free, sleeps in 48h, keep-warm with UptimeRobot)
+   - 2b. [DigitalOcean App Platform](#2b-digitalocean-app-platform-5mo) ($5/mo, never sleeps)
 3. [Deploy the frontend to Cloudflare Pages](#3-deploy-the-frontend-to-cloudflare-pages)
-4. [Keep the Space awake with UptimeRobot](#4-keep-the-space-awake-with-uptimerobot)
+4. [Keep the backend awake with UptimeRobot](#4-keep-the-backend-awake-with-uptimerobot) (HF only)
 5. [Add Cloudflare Turnstile (bot protection)](#5-add-cloudflare-turnstile-bot-protection)
 6. [Enable BYOK + SlowAPI (cost protection)](#6-enable-byok--slowapi-cost-protection)
 7. [Observability (optional)](#7-observability-optional)
@@ -41,26 +43,32 @@ Architecture:
 
 ## 1. Prerequisites
 
-- GitHub repo pushed (currently `master` branch on github.com/p-kowadkar/RegRadar)
+- GitHub repo pushed (`prod` branch on github.com/p-kowadkar/RegRadar)
 - A populated `.env` saved in 1Password ("RegRadar — .env (prod)")
 - Accounts (all free):
-  - [huggingface.co](https://huggingface.co) — backend host
-  - [dash.cloudflare.com](https://dash.cloudflare.com) — frontend host + Turnstile
-  - [uptimerobot.com](https://uptimerobot.com) — keep-warm pings
+  - **[huggingface.co](https://huggingface.co)** — backend option A (free)
+  - **OR [cloud.digitalocean.com](https://cloud.digitalocean.com)** — backend option B ($5/mo, $200 starter credit for new accounts)
+  - [dash.cloudflare.com](https://dash.cloudflare.com) — frontend + Turnstile (free)
+  - [uptimerobot.com](https://uptimerobot.com) — keep-warm pings (HF only, free)
 - Optional later: Cloudflare custom domain ($10/yr)
 
 ---
 
-## 2. Deploy the backend to Hugging Face Spaces
+## 2. Deploy the backend — pick one host
+
+The Dockerfile is portable: it defaults to port 7860 (HF Spaces) but reads
+`$PORT` at runtime so it also works on DO App Platform, Railway, Fly.io, etc.
+
+### 2a. Hugging Face Spaces (free)
 
 HF Spaces runs your `Dockerfile` and binds it to a public URL like
-`https://<username>-regradar.hf.space`. Free CPU-basic tier sleeps only after
+`https://pkowadkar-regradar.hf.space`. Free CPU-basic tier sleeps only after
 **48 hours** idle — UptimeRobot keeps it permanently warm (step 4).
 
-### 2a. Create the Space
+**Create the Space:**
 
 1. Go to https://huggingface.co/new-space
-2. **Owner**: your username (e.g., `pkowadkar`)
+2. **Owner**: `pkowadkar`
 3. **Space name**: `regradar`
 4. **License**: MIT
 5. **SDK**: **Docker** → **Blank**
@@ -68,13 +76,13 @@ HF Spaces runs your `Dockerfile` and binds it to a public URL like
 7. **Visibility**: Public
 8. Click **Create Space**
 
-### 2b. Push the backend code
+**Push the backend code:**
 
 The Space is its own git repo. From the RegRadar repo root:
 
 ```powershell
-git remote add hf https://huggingface.co/spaces/<username>/regradar
-git push hf master:main
+git remote add hf https://huggingface.co/spaces/pkowadkar/regradar
+git push hf prod:main
 ```
 
 You may need an HF access token (`hf_…`) when prompted:
@@ -83,41 +91,21 @@ You may need an HF access token (`hf_…`) when prompted:
 
 HF auto-builds the `Dockerfile` and starts the container. First build takes
 **3-5 minutes**. Watch logs at:
-`https://huggingface.co/spaces/<username>/regradar?logs=build`
+`https://huggingface.co/spaces/pkowadkar/regradar?logs=build`
 
-### 2c. Configure secrets
+**Configure secrets:**
 
 In the Space → **Settings** → **Variables and secrets** → **New secret**.
-Add every value from `.env` Sections [A] + [B], **one secret per row**:
+Add every value from `.env` Sections [A] + [B] (see the [shared secrets
+list](#secrets-for-either-host)). Restart the Space after saving.
 
-| Secret name | Source in .env |
-|---|---|
-| `CLICKHOUSE_HOST` | section [A] |
-| `CLICKHOUSE_PORT` | `8443` |
-| `CLICKHOUSE_USER` | |
-| `CLICKHOUSE_PASSWORD` | |
-| `CLICKHOUSE_SECURE` | `true` |
-| `CLICKHOUSE_DATABASE` | `regradar` |
-| `OPENROUTER_API_KEY` | recommended LLM (one key = 100+ models) |
-| `FIRECRAWL_API_KEY` | recommended scraper (free monthly tier) |
-| `GOOGLE_CLOUD_PROJECT` | optional, only if using Vertex ADC instead of OpenRouter |
-| `GOOGLE_CLOUD_LOCATION` | `us-central1` (optional, paired with above) |
-| `NIMBLE_API_KEY` | optional, falls back to Firecrawl if absent |
-| `APP_CORS_ORIGINS` | `https://regradar.pages.dev` (add custom domain later) |
-| `ENABLE_SCHEDULERS` | `true` (or `false` for pure on-demand) |
-| `WATCHER_SCRAPE_INTERVAL_SECONDS` | `86400` (once/day in prod) |
-| `IMPACT_AGENT_POLL_INTERVAL_SECONDS` | `300` (every 5 min) |
-
-Secrets inject as env vars on next container restart. After saving, click
-**Restart this Space** (top right).
-
-### 2d. Verify the backend
+**Verify the backend:**
 
 ```powershell
-curl https://<username>-regradar.hf.space/health
+curl https://pkowadkar-regradar.hf.space/health
 # -> {"status":"ok"}
 
-curl https://<username>-regradar.hf.space/api/dashboard/summary
+curl https://pkowadkar-regradar.hf.space/api/dashboard/summary
 # -> {"monitored":12,"accountedFor":8,...}
 ```
 
@@ -126,15 +114,102 @@ secrets aren't injected yet — restart the Space.
 
 ---
 
+### 2b. DigitalOcean App Platform ($5/mo)
+
+DO App Platform reads your `Dockerfile` straight from GitHub, builds it on
+their infra, and exposes the container on a `*.ondigitalocean.app` URL with
+free SSL. **Never sleeps**, no UptimeRobot needed.
+
+**Create the App:**
+
+1. Go to https://cloud.digitalocean.com/apps → **Create App**
+2. **Service Provider**: GitHub → **Authorize DigitalOcean**
+3. **Repository**: `p-kowadkar/RegRadar`
+4. **Branch**: `prod`
+5. **Source Directory**: leave as `/` (Dockerfile is at the repo root)
+6. **Autodeploy on push**: leave checked
+7. Click **Next**
+
+**Configure the resource:**
+
+App Platform should auto-detect the Dockerfile. On the **Resources** screen:
+
+1. Click the auto-created resource (named `regradar` or similar)
+2. **Resource Type**: keep as **Web Service**
+3. **Edit** → **Plan**:
+   - **Basic** plan
+   - **Container Size**: `512 MB RAM | 1 vCPU` ($5/mo)
+4. **HTTP Port**: `8080` (App Platform's default — our Dockerfile binds to `$PORT` automatically)
+5. **Health Check Path**: `/health` (uses the endpoint we built)
+6. Click **Back**, then **Next**
+
+**Set environment variables:**
+
+Still on the create screen → **Environment Variables** for the service. Add
+every value from `.env` Sections [A] + [B] (see the [shared secrets
+list](#secrets-for-either-host)). Mark `CLICKHOUSE_PASSWORD`, all API keys,
+and `TURNSTILE_SECRET_KEY` as **encrypted**.
+
+Click **Next** → **Region** (pick the closest to your ClickHouse Cloud
+region — likely `nyc` or `sfo`) → **App Info** → name it `regradar` →
+**Create Resources**.
+
+Build takes ~5 minutes. Watch logs in the dashboard. Final URL appears at
+the top: `https://regradar-XXXXX.ondigitalocean.app`.
+
+**Verify:**
+
+```powershell
+curl https://regradar-XXXXX.ondigitalocean.app/health
+# -> {"status":"ok"}
+
+curl https://regradar-XXXXX.ondigitalocean.app/api/dashboard/summary
+# -> {"monitored":12,"accountedFor":8,...}
+```
+
+**Push-to-deploy**: with Autodeploy enabled, every `git push origin prod`
+triggers a rebuild (~5 min). To deploy a hotfix without waiting for build,
+use the dashboard's **Actions → Force Rebuild and Deploy**.
+
+---
+
+### Secrets for either host
+
+Add to HF Space → Variables and secrets, OR DO App Platform → Environment
+Variables. Same list either way.
+
+| Secret | Value / source |
+|---|---|
+| `CLICKHOUSE_HOST` | from your `.env` |
+| `CLICKHOUSE_PORT` | `8443` |
+| `CLICKHOUSE_USER` | `default` |
+| `CLICKHOUSE_PASSWORD` | from your `.env` (mark encrypted on DO) |
+| `CLICKHOUSE_SECURE` | `true` |
+| `CLICKHOUSE_DATABASE` | `regradar` |
+| `OPENROUTER_API_KEY` | recommended LLM (mark encrypted) |
+| `FIRECRAWL_API_KEY` | recommended scraper (mark encrypted) |
+| `GOOGLE_CLOUD_PROJECT` | optional, only if using Vertex ADC instead |
+| `GOOGLE_CLOUD_LOCATION` | `us-central1` (paired with above) |
+| `NIMBLE_API_KEY` | optional, falls back to Firecrawl |
+| `LOGFIRE_TOKEN` | optional (step 7) |
+| `APP_CORS_ORIGINS` | `https://regradar.pages.dev` (update after step 3) |
+| `ENABLE_SCHEDULERS` | `false` (recommended for public demo) |
+| `BYOK_ENABLED` | `true` |
+| `DAILY_LLM_CALL_BUDGET` | `500` |
+| `TURNSTILE_ENABLED` | `false` (set `true` after step 5) |
+| `TURNSTILE_SECRET_KEY` | (after step 5, mark encrypted) |
+
+---
+
 ## 3. Deploy the frontend to Cloudflare Pages
 
 ### 3a. Connect the repo
 
 1. https://dash.cloudflare.com → **Workers & Pages** → **Create** → **Pages**
-2. **Connect to Git** → select **RegRadar** → branch **master**
+2. **Connect to Git** → select **RegRadar** → branch **prod**
 3. **Framework preset**: Vite
 4. **Build command**: `npm run build`
-5. **Build output directory**: `frontend/dist`
+5. **Build output directory**: `dist`
 6. **Root directory** (advanced): `frontend`
 
 ### 3b. Build-time environment variables
@@ -143,7 +218,7 @@ Settings → Environment variables → Production:
 
 | Variable | Value |
 |---|---|
-| `VITE_API_URL` | `https://<username>-regradar.hf.space` |
+| `VITE_API_URL` | HF: `https://pkowadkar-regradar.hf.space` <br> DO: `https://regradar-XXXXX.ondigitalocean.app` |
 | `VITE_TURNSTILE_SITE_KEY` | (set after step 5) |
 | `VITE_ENABLE_BYOK` | `true` |
 
@@ -162,25 +237,27 @@ Restart the Space.
 
 ---
 
-## 4. Keep the Space awake with UptimeRobot
+## 4. Keep the backend awake with UptimeRobot
+
+> **Skip this step if you chose DigitalOcean App Platform (2b).** DO doesn't
+> sleep — UptimeRobot is only useful there as an outage notifier (still
+> worth setting up but not critical).
 
 HF Spaces free tier sleeps after 48 hours idle. A 5-minute ping makes that
 window irrelevant.
 
 1. https://uptimerobot.com → Sign up (free)
 2. **+ New Monitor** → **HTTPS**
-3. **Friendly name**: `RegRadar HF Space`
-4. **URL**: `https://<username>-regradar.hf.space/health`
+3. **Friendly name**: `RegRadar backend`
+4. **URL**: `https://pkowadkar-regradar.hf.space/health` (HF) or `https://regradar-XXXXX.ondigitalocean.app/health` (DO)
 5. **Monitoring interval**: 5 minutes (free tier minimum)
 6. **Save**
 
-You'll get an email if the Space stops responding. Free tier supports 50
-monitors, so you can also watch `regradar.pages.dev` and ClickHouse Cloud
-endpoints.
+You'll get an email if the backend stops responding. Free tier supports 50
+monitors, so also add the Pages URL.
 
-**Why this works**: each `/health` request resets HF Spaces' idle timer.
-50,000 keep-warm requests/month doesn't trigger any rate limit on HF — it's
-a trivial response.
+**Why this works for HF**: each `/health` request resets the idle timer.
+50,000 keep-warm requests/month is trivial — no rate limit hit.
 
 ---
 
@@ -312,9 +389,10 @@ You can run both side-by-side. Each is a no-op if its env var is missing.
 |---|---|---|
 | **ClickHouse data** | Daily auto-snapshots, 2 retained, basic tier | None — restore via Cloud console → Backups |
 | **`.env` secrets** | 1Password entry "RegRadar — .env (prod)" | Update after every change |
-| **Code** | GitHub `master` branch | Already pushed |
-| **HF Space code** | HF git repo (mirror of GitHub) | `git push hf master:main` after each release |
-| **Cloudflare Pages config** | Tied to GitHub branch | Redeploys auto on push |
+| **Code** | GitHub `prod` branch | Already pushed |
+| **HF Space code** (if using 2a) | HF git repo (mirror of GitHub) | `git push hf prod:main` after each release |
+| **DO App Platform** (if using 2b) | Autodeploy on push to `prod` | Nothing — push triggers rebuild |
+| **Cloudflare Pages config** | Tied to GitHub `prod` branch | Redeploys auto on push |
 | **50,000 cc_accounts rows** | Deterministic regen | `python scripts/setup_cc_accounts.py` |
 
 **Optional belt-and-suspenders**: weekly Parquet dump to a free 5 GB GCS bucket:
@@ -334,6 +412,21 @@ Schedule it via APScheduler or cron. Skip for hackathon — auto-snapshots are e
 
 ## 9. Cost ceiling math
 
+### Hosting fixed cost
+
+| Component | HF Spaces path | DO App Platform path |
+|---|---|---|
+| Backend | $0/mo (free CPU-basic) | $5/mo (512 MiB shared) |
+| Frontend | $0/mo (Cloudflare Pages) | $0/mo (Cloudflare Pages) |
+| Cloudflare Turnstile | $0 | $0 |
+| UptimeRobot | $0 | $0 |
+| ClickHouse Cloud | what you already pay | what you already pay |
+| **Hosting baseline** | **$0/mo** | **$5/mo** |
+
+With $200 DO starter credit: ~40 months runway on the DO path.
+
+### Variable LLM cost
+
 With Cloudflare Turnstile + SlowAPI 10/day/IP cap, paid Gemini 3.5 Flash
 (~$0.0075 per Impact Analysis call):
 
@@ -343,21 +436,30 @@ With Cloudflare Turnstile + SlowAPI 10/day/IP cap, paid Gemini 3.5 Flash
 | 10 casual visitors, max usage | ~$0.75 |
 | 100 visitors, max usage | ~$7.50 |
 | Viral / abuse attempt | Capped at `DAILY_LLM_CALL_BUDGET` × $0.0075 = ~$3.75 |
+| BYOK users (regardless of count) | $0 — their key, their bill |
 
 `DAILY_LLM_CALL_BUDGET=500` is the hard kill switch — once exceeded, the
 demo endpoint returns 503 until UTC midnight. No way to overrun this.
-
-ClickHouse Cloud charges separately for the cluster itself (typically
-$0.30/hr while active, $0/hr when idle on Basic tier) — already paid,
-unchanged by this deploy.
 
 ---
 
 ## Troubleshooting
 
-**HF Space build fails on `pip install`**
+**HF Space or DO App build fails on `pip install`**
 Check the build log. If it's a wheel build (gcc), the Dockerfile installs
 `gcc g++` — make sure the base image is `python:3.11-slim`, not `:3.11-alpine`.
+
+**DO App Platform: backend OOM-killed mid-request**
+512 MiB plan is tight when Pydantic AI + Gemini SDK both load. Symptoms:
+container restarts every few minutes, logs show `SIGKILL`. Fix: upgrade
+the resource to `1 GB RAM` plan ($10/mo) in App settings. Per-second billing
+means you can switch back down at any time.
+
+**DO App Platform: port misconfigured**
+Logs show "Application failed to start on port 8080". Our Dockerfile reads
+`$PORT` (set to 8080 by App Platform), so check the **HTTP Port** setting
+in App settings — should be 8080. If you overrode it, either change it
+back or set `PORT` to match in env vars.
 
 **Frontend loads but every chart is empty**
 Open browser DevTools → Network. Look for the API call. If it's hitting
