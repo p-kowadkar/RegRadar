@@ -188,6 +188,23 @@ export interface CrawlResponse {
   result: CrawlVerification | null;
 }
 
+export type ValidationErrorCategory =
+  | "auth"
+  | "model"
+  | "network"
+  | "missing"
+  | "other";
+
+export interface ValidationResult {
+  ok: boolean;
+  provider?: string | null;
+  model?: string | null;
+  latency_ms?: number | null;
+  error_category?: ValidationErrorCategory | null;
+  error?: string | null;
+  detail?: string | null;
+}
+
 export type TriggerScenario =
   | "schema_enrichment_fcra"
   | "dispute_filed"

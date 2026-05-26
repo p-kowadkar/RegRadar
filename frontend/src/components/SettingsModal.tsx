@@ -1,6 +1,21 @@
 import { useEffect, useState } from "react";
-import { ExternalLink, Eye, EyeOff, KeyRound, X } from "lucide-react";
-import type { LLMProvider, ScraperProvider, UserKeys } from "../types";
+import {
+  AlertCircle,
+  CheckCircle2,
+  ExternalLink,
+  Eye,
+  EyeOff,
+  KeyRound,
+  Loader2,
+  X,
+} from "lucide-react";
+import { api } from "../api/client";
+import type {
+  LLMProvider,
+  ScraperProvider,
+  UserKeys,
+  ValidationResult,
+} from "../types";
 
 interface Props {
   open: boolean;
@@ -35,14 +50,35 @@ const OPENROUTER_SUGGESTIONS = [
   "meta-llama/llama-4-maverick",
 ];
 
+type ValidationStatus =
+  | { state: "idle" }
+  | { state: "loading" }
+  | { state: "done"; result: ValidationResult }
+  | { state: "error"; message: string };
+
+
 export function SettingsModal({ open, initial, onSave, onClose }: Props) {
   const [keys, setKeys] = useState<UserKeys>(initial);
   const [showLLM, setShowLLM] = useState(false);
   const [showScraper, setShowScraper] = useState(false);
+  const [llmStatus, setLlmStatus] = useState<ValidationStatus>({ state: "idle" });
+  const [scraperStatus, setScraperStatus] = useState<ValidationStatus>({ state: "idle" });
 
   useEffect(() => {
-    if (open) setKeys(initial);
+    if (open) {
+      setKeys(initial);
+      setLlmStatus({ state: "idle" });
+      setScraperStatus({ state: "idle" });
+    }
   }, [open, initial]);
+
+  // Reset validation status when the user edits the corresponding key
+  useEffect(() => {
+    setLlmStatus({ state: "idle" });
+  }, [keys.llmKey, keys.llmProvider, keys.llmModel]);
+  useEffect(() => {
+    setScraperStatus({ state: "idle" });
+  }, [keys.scraperKey, keys.scraperProvider]);
 
   if (!open) return null;
 
@@ -63,6 +99,44 @@ export function SettingsModal({ open, initial, onSave, onClose }: Props) {
     onSave(empty);
     onClose();
   };
+
+  const handleValidateLLM = async () => {
+    if (!keys.llmKey || !keys.llmProvider) return;
+    setLlmStatus({ state: "loading" });
+    try {
+      const result = await api.validateLLM({
+        llmKey: keys.llmKey,
+        llmProvider: keys.llmProvider,
+        llmModel: keys.llmModel || undefined,
+      });
+      setLlmStatus({ state: "done", result });
+    } catch (e) {
+      setLlmStatus({
+        state: "error",
+        message: e instanceof Error ? e.message : String(e),
+      });
+    }
+  };
+
+  const handleValidateScraper = async () => {
+    if (!keys.scraperKey || !keys.scraperProvider) return;
+    setScraperStatus({ state: "loading" });
+    try {
+      const result = await api.validateScraper({
+        scraperKey: keys.scraperKey,
+        scraperProvider: keys.scraperProvider,
+      });
+      setScraperStatus({ state: "done", result });
+    } catch (e) {
+      setScraperStatus({
+        state: "error",
+        message: e instanceof Error ? e.message : String(e),
+      });
+    }
+  };
+
+  const llmReady = Boolean(keys.llmKey && keys.llmProvider);
+  const scraperReady = Boolean(keys.scraperKey && keys.scraperProvider);
 
   return (
     <div
@@ -188,6 +262,13 @@ export function SettingsModal({ open, initial, onSave, onClose }: Props) {
                 Model: <code className="font-mono text-text-secondary">gpt-5.4-mini</code> (locked — reasoning model, ~$0.40/$1.60 per 1M tokens)
               </div>
             )}
+
+            <ValidateRow
+              ready={llmReady}
+              status={llmStatus}
+              onClick={handleValidateLLM}
+              kind="LLM"
+            />
           </div>
 
           {/* Scraper key */}
@@ -236,6 +317,13 @@ export function SettingsModal({ open, initial, onSave, onClose }: Props) {
                 {showScraper ? <EyeOff size={12} /> : <Eye size={12} />}
               </button>
             </div>
+
+            <ValidateRow
+              ready={scraperReady}
+              status={scraperStatus}
+              onClick={handleValidateScraper}
+              kind="scraper"
+            />
           </div>
         </div>
 
@@ -277,4 +365,107 @@ function llmKeyPlaceholder(provider: LLMProvider | ""): string {
     default:
       return "paste your key";
   }
+}
+
+
+interface ValidateRowProps {
+  ready: boolean;
+  status: ValidationStatus;
+  onClick: () => void;
+  kind: "LLM" | "scraper";
+}
+
+function ValidateRow({ ready, status, onClick, kind }: ValidateRowProps) {
+  const loading = status.state === "loading";
+  return (
+    <div className="space-y-1">
+      <div className="flex items-center justify-between gap-2">
+        <button
+          type="button"
+          onClick={onClick}
+          disabled={!ready || loading}
+          className="inline-flex items-center gap-1.5 rounded border border-line bg-surface-alt px-2.5 py-1 text-[11px] text-text-secondary transition hover:border-line-strong hover:text-text-primary disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          {loading ? (
+            <>
+              <Loader2 size={11} className="animate-spin" />
+              Validating…
+            </>
+          ) : (
+            <>Validate {kind} key</>
+          )}
+        </button>
+        <StatusBadge status={status} />
+      </div>
+      <StatusDetail status={status} />
+    </div>
+  );
+}
+
+function StatusBadge({ status }: { status: ValidationStatus }) {
+  if (status.state === "idle" || status.state === "loading") return null;
+  if (status.state === "error") {
+    return (
+      <span className="inline-flex items-center gap-1 rounded border border-status-critical/40 bg-status-critical/10 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-status-critical">
+        <AlertCircle size={10} />
+        Request failed
+      </span>
+    );
+  }
+  // status.state === "done"
+  const r = status.result;
+  if (r.ok) {
+    return (
+      <span className="inline-flex items-center gap-1 rounded border border-status-ok/40 bg-status-ok/10 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-status-ok">
+        <CheckCircle2 size={10} />
+        Valid · {r.latency_ms}ms
+      </span>
+    );
+  }
+  return (
+    <span className="inline-flex items-center gap-1 rounded border border-status-critical/40 bg-status-critical/10 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-status-critical">
+      <AlertCircle size={10} />
+      {r.error_category ?? "error"}
+    </span>
+  );
+}
+
+function StatusDetail({ status }: { status: ValidationStatus }) {
+  if (status.state === "error") {
+    return (
+      <p className="text-[11px] text-status-critical">{status.message}</p>
+    );
+  }
+  if (status.state !== "done") return null;
+  const r = status.result;
+  if (r.ok) {
+    return (
+      <p className="text-[11px] text-text-muted">
+        Key works. {r.provider && <span className="font-mono">{r.provider}</span>}
+        {r.model && r.model !== "(default)" && (
+          <>
+            {" · "}
+            <span className="font-mono">{r.model}</span>
+          </>
+        )}
+      </p>
+    );
+  }
+  return (
+    <div className="space-y-0.5">
+      {r.error && (
+        <p className="text-[11px] text-status-critical">{r.error}</p>
+      )}
+      {r.detail && r.detail !== r.error && (
+        <details className="text-[11px] text-text-muted">
+          <summary className="cursor-pointer hover:text-text-secondary">
+            Provider detail
+          </summary>
+          <pre className="mt-1 whitespace-pre-wrap break-words rounded border border-line bg-surface-alt p-2 font-mono text-[10px]">
+            {r.detail}
+          </pre>
+        </details>
+      )}
+    </div>
+  );
 }

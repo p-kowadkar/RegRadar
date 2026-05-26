@@ -12,6 +12,7 @@ import type {
   TriggerResponse,
   TriggerScenario,
   UserKeys,
+  ValidationResult,
   Violation,
 } from "../types";
 
@@ -101,4 +102,55 @@ export const api = {
   ) => post<TriggerResponse>("/api/trigger", { scenario, account_id }),
   triggerCrawl: (regulation_id: string) =>
     post<CrawlResponse>("/api/trigger/crawl", { regulation_id }),
+
+  // ── BYOK validation (override headers so the modal can validate
+  //    pending values without first saving them to localStorage) ──
+  validateLLM: (override?: {
+    llmKey: string;
+    llmProvider: string;
+    llmModel?: string;
+  }) => validateWithOverride("/api/byok/validate/llm", override, "llm"),
+  validateScraper: (override?: {
+    scraperKey: string;
+    scraperProvider: string;
+  }) => validateWithOverride("/api/byok/validate/scraper", override, "scraper"),
 };
+
+
+async function validateWithOverride(
+  path: string,
+  override: Record<string, string | undefined> | undefined,
+  kind: "llm" | "scraper",
+): Promise<ValidationResult> {
+  // Build headers from EITHER the explicit override (modal values not yet saved)
+  // OR the saved _userKeys (Validate after Save). Turnstile token always attached.
+  const h: Record<string, string> = { "Content-Type": "application/json" };
+  if (override) {
+    if (kind === "llm" && override.llmKey && override.llmProvider) {
+      h["X-User-LLM-Key"] = override.llmKey;
+      h["X-User-LLM-Provider"] = override.llmProvider;
+      if (override.llmModel) h["X-User-LLM-Model"] = override.llmModel;
+    }
+    if (kind === "scraper" && override.scraperKey && override.scraperProvider) {
+      h["X-User-Scraper-Key"] = override.scraperKey;
+      h["X-User-Scraper-Provider"] = override.scraperProvider;
+    }
+  } else {
+    Object.assign(h, buildHeaders());
+  }
+  if (_turnstileToken && !h["cf-turnstile-response"]) {
+    h["cf-turnstile-response"] = _turnstileToken;
+  }
+  const res = await fetch(`${BASE}${path}`, {
+    method: "POST",
+    body: "{}",
+    headers: h,
+  });
+  // Validation endpoint always returns 200 with structured body, even on failure;
+  // only network/server faults throw here.
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`${res.status} ${res.statusText}: ${text}`);
+  }
+  return (await res.json()) as ValidationResult;
+}

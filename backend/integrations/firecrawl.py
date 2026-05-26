@@ -31,6 +31,19 @@ def _client_for(api_key: str | None) -> FirecrawlApp:
     return _get_client()
 
 
+def _extract_markdown(result: object) -> str:
+    """Pull markdown content out of whatever Firecrawl returned.
+
+    v2 returns a Pydantic Document model with .markdown attribute.
+    v1 returned a dict {"markdown": "...", ...}.
+    Support both shapes defensively so a future SDK bump doesn't re-break us.
+    """
+    md = getattr(result, "markdown", None)
+    if md is None and isinstance(result, dict):
+        md = result.get("markdown", "")
+    return md or ""
+
+
 async def scrape_url(url: str, *, api_key_override: str | None = None) -> ScrapedDocument:
     """Same return type as nimble.scrape_url — drop-in fallback.
 
@@ -40,15 +53,25 @@ async def scrape_url(url: str, *, api_key_override: str | None = None) -> Scrape
     """
     try:
         client = _client_for(api_key_override)
-        result = await asyncio.to_thread(
-            client.scrape_url,
-            url,
-            params={"formats": ["markdown"]},
-        )
-        content = result.get("markdown", "")
+        # firecrawl-py v2 uses client.scrape(url, formats=[...]).
+        # v1 used client.scrape_url(url, params={"formats": [...]}).
+        # Prefer v2; fall back to v1 if the new method isn't there.
+        if hasattr(client, "scrape"):
+            result = await asyncio.to_thread(
+                client.scrape,
+                url,
+                formats=["markdown"],
+            )
+        else:
+            result = await asyncio.to_thread(
+                client.scrape_url,
+                url,
+                params={"formats": ["markdown"]},
+            )
+        content = _extract_markdown(result)
         h = sha256(content.encode()).hexdigest()
         log.info(
-            "firecrawl.fallback_scrape_success",
+            "firecrawl.scrape_success",
             url=url,
             content_length=len(content),
             byok=bool(api_key_override),
@@ -61,5 +84,5 @@ async def scrape_url(url: str, *, api_key_override: str | None = None) -> Scrape
             scraper_used="firecrawl",
         )
     except Exception as e:
-        log.error("firecrawl.fallback_failure", url=url, error=str(e))
+        log.error("firecrawl.scrape_failure", url=url, error=str(e))
         raise

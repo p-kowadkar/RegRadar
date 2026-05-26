@@ -29,6 +29,7 @@ from .api.dashboard import router as dashboard_router
 from .api.violations import router as violations_router
 from .api.agents import router as agents_router
 from .api.trigger import router as trigger_router
+from .api.byok import router as byok_router
 from .api.security import limiter
 
 app = FastAPI(title="RegRadar API", version="0.1.0")
@@ -72,6 +73,7 @@ app.include_router(dashboard_router)
 app.include_router(violations_router)
 app.include_router(agents_router)
 app.include_router(trigger_router)
+app.include_router(byok_router)
 
 
 @app.get("/")
