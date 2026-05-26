@@ -19,6 +19,7 @@ from typing import Literal
 
 from pydantic import BaseModel
 from pydantic_ai import Agent
+from pydantic_ai.models import Model
 
 from backend.agents.base import AGENT_POLICY_CRAWLER, agent_run_context
 from backend.integrations.clickhouse_client import get_client
@@ -107,11 +108,17 @@ Rules:
 - NEVER hallucinate a regulation citation or dollar amount.
 """
 
-crawler_agent = Agent(
-    model=vertex_model("gemini-2.5-flash"),
-    output_type=CrawlVerification,
-    system_prompt=_SYSTEM_PROMPT,
-)
+def _make_crawler_agent(model: Model | None = None) -> Agent:
+    """Build a Pydantic AI Agent bound to either the singleton model or a BYOK override."""
+    return Agent(
+        model=model or vertex_model("gemini-2.5-flash"),
+        output_type=CrawlVerification,
+        system_prompt=_SYSTEM_PROMPT,
+    )
+
+
+# Module-level default agent used by the scheduler path.
+crawler_agent = _make_crawler_agent()
 
 
 # ════════════════════════════════════════════════════════════════
@@ -135,11 +142,32 @@ async def _get_source_url(client, regulation_id: str) -> str:
     return url
 
 
-async def _scrape_regulation(source_url: str) -> str:
-    """Scrape via Nimble; fall back to Firecrawl if content is empty or too short."""
+async def _scrape_regulation(
+    source_url: str,
+    *,
+    scraper_key: str | None = None,
+    scraper_provider: str | None = None,
+) -> str:
+    """Scrape via Nimble; fall back to Firecrawl if content is empty or too short.
+
+    If a BYOK scraper_key is provided, route to that provider directly
+    (no fallback) so the user's key is honored end-to-end.
+    """
     from backend.integrations import nimble, firecrawl
     from backend.integrations.nimble import NimbleError
 
+    # BYOK path: explicit provider, no silent fallback.
+    if scraper_key and scraper_provider:
+        provider = scraper_provider.lower().strip()
+        if provider == "nimble":
+            doc = await nimble.scrape_url(url=source_url, api_key_override=scraper_key)
+            return doc.content_markdown
+        if provider == "firecrawl":
+            doc = await firecrawl.scrape_url(url=source_url, api_key_override=scraper_key)
+            return doc.content_markdown
+        raise ValueError(f"Unknown BYOK scraper provider: {scraper_provider}")
+
+    # Default path: server keys, Nimble -> Firecrawl fallback.
     try:
         doc = await nimble.scrape_url(url=source_url)
         if len(doc.content_markdown.strip()) < 200:
@@ -201,8 +229,23 @@ async def _write_policy_change(
 # ════════════════════════════════════════════════════════════════
 
 
-async def crawl_one(regulation_id: str) -> CrawlVerification | None:
-    """Crawl a single regulation. Returns None if scraping failed entirely."""
+async def crawl_one(
+    regulation_id: str,
+    *,
+    llm_model: Model | None = None,
+    scraper_key: str | None = None,
+    scraper_provider: str | None = None,
+) -> CrawlVerification | None:
+    """Crawl a single regulation. Returns None if scraping failed entirely.
+
+    BYOK overrides:
+      llm_model: replace the default crawler_agent's model with one bound to
+                 the user's LLM key (built via vertex_model_for_user).
+      scraper_key + scraper_provider: route Nimble/Firecrawl through the
+                 user's scraper key directly (no fallback chain).
+    """
+    agent = crawler_agent if llm_model is None else _make_crawler_agent(llm_model)
+
     async with agent_run_context(agent_id=AGENT_POLICY_CRAWLER, trigger_id=regulation_id):
         client = await get_client()
 
@@ -221,9 +264,13 @@ async def crawl_one(regulation_id: str) -> CrawlVerification | None:
         # 2. Resolve source URL
         source_url = await _get_source_url(client, regulation_id)
 
-        # 3. Scrape (Nimble → Firecrawl)
+        # 3. Scrape (Nimble → Firecrawl, or BYOK provider when specified)
         try:
-            text = await _scrape_regulation(source_url)
+            text = await _scrape_regulation(
+                source_url,
+                scraper_key=scraper_key,
+                scraper_provider=scraper_provider,
+            )
         except Exception as e:
             log.error("crawler.scrape_failed", regulation_id=regulation_id, error=str(e))
             await _write_policy_change(
@@ -256,7 +303,7 @@ async def crawl_one(regulation_id: str) -> CrawlVerification | None:
             version=row["version"],
             source_url=source_url,
         )
-        result = await crawler_agent.run(
+        result = await agent.run(
             PolicyCrawlInput(
                 regulation=reg_record, scraped_text=text[:8000]
             ).model_dump_json()

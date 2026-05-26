@@ -1,0 +1,39 @@
+# Version control + build artifacts
+.git
+.gitignore
+.github
+
+# Frontend (deployed separately on Cloudflare Pages)
+frontend
+node_modules
+
+# Python local artifacts
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+venv
+.venv
+*.egg-info
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+# Local-only secrets + IDE
+.env
+.env.*
+!.env.example
+.vscode
+.idea
+.claude
+
+# Docs, images, large extras — not needed at runtime
+docs
+images
+*.md
+!README.md
+
+# OS junk
+.DS_Store
+Thumbs.db

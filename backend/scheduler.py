@@ -21,7 +21,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from backend.utils.env import get_int  # noqa: E402
+from backend.utils.env import get_bool, get_int  # noqa: E402
 from backend.utils.logging import configure_logging, get_logger  # noqa: E402
 from backend.agents.policy_crawler import crawl_all  # noqa: E402
 from backend.agents.impact_analysis import run_impact_analysis_agent  # noqa: E402
@@ -74,38 +74,57 @@ def on_job_event(event):
 
 
 async def main() -> None:
+    # Master switch -- HF Spaces / Cloudflare deploy sets this false and uses
+    # the manual /api/trigger endpoint instead of background crons.
+    if not get_bool("ENABLE_SCHEDULERS", default=True):
+        log.info("scheduler.disabled", reason="ENABLE_SCHEDULERS=false")
+        loop = asyncio.get_running_loop()
+        stop = loop.create_future()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, stop.set_result, sig)
+        await stop
+        return
+
+    # Per-job enables (lets you run crawler only, or impact only)
+    crawler_enabled = get_bool("ENABLE_POLICY_CRAWLER", default=True)
+    impact_enabled = get_bool("ENABLE_IMPACT_ANALYSIS", default=True)
+
     crawl_interval = get_int("WATCHER_SCRAPE_INTERVAL_SECONDS", default=3600)
     impact_interval = get_int("IMPACT_AGENT_POLL_INTERVAL_SECONDS", default=60)
     log.info(
         "scheduler.starting",
         crawl_interval_seconds=crawl_interval,
         impact_interval_seconds=impact_interval,
+        crawler_enabled=crawler_enabled,
+        impact_enabled=impact_enabled,
     )
 
     scheduler = AsyncIOScheduler()
     scheduler.add_listener(on_job_event, EVENT_JOB_EXECUTED | EVENT_JOB_ERROR)
 
-    scheduler.add_job(
-        crawl_job,
-        trigger="interval",
-        seconds=crawl_interval,
-        id="policy_crawler",
-        name="Policy Crawler",
-        max_instances=1,
-        misfire_grace_time=60,
-        next_run_time=datetime.now(timezone.utc),
-    )
+    if crawler_enabled:
+        scheduler.add_job(
+            crawl_job,
+            trigger="interval",
+            seconds=crawl_interval,
+            id="policy_crawler",
+            name="Policy Crawler",
+            max_instances=1,
+            misfire_grace_time=60,
+            next_run_time=datetime.now(timezone.utc),
+        )
 
-    scheduler.add_job(
-        impact_analysis_job,
-        trigger="interval",
-        seconds=impact_interval,
-        id="impact_analysis",
-        name="Impact Analysis Agent",
-        max_instances=1,  # never overlap -- cursor must advance sequentially
-        misfire_grace_time=30,
-        next_run_time=datetime.now(timezone.utc),
-    )
+    if impact_enabled:
+        scheduler.add_job(
+            impact_analysis_job,
+            trigger="interval",
+            seconds=impact_interval,
+            id="impact_analysis",
+            name="Impact Analysis Agent",
+            max_instances=1,  # never overlap -- cursor must advance sequentially
+            misfire_grace_time=30,
+            next_run_time=datetime.now(timezone.utc),
+        )
 
     scheduler.start()
     log.info(

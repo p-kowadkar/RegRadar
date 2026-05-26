@@ -35,12 +35,22 @@ pyarrow>=18.0.0
 nimble_python>=0.18.0
 firecrawl-py>=1.6.7                       # silent fallback
 
-# ─── Datadog Observability ───
-ddtrace>=4.8.0                            # auto-instruments Pydantic AI + google-genai
+# ─── Observability (pick one or both; both are optional) ───
+# Logfire: Pydantic AI's first-party trace UI. Free 10M spans/mo. Set
+#   LOGFIRE_TOKEN in .env to enable -- otherwise it's a no-op import.
+logfire>=4.0.0
+# Datadog: sponsor-grade LLM Obs cloud + AI Agent Console. Optional.
+#   Set DD_API_KEY to enable; ddtrace auto-instruments Pydantic AI + google-genai.
+ddtrace>=4.8.0
 datadog>=0.50.1                           # statsd gauges for the dashboard
 
 # ─── Resilience ───
 tenacity>=9.0.0
+
+# ─── Public-demo guards (rate limiting, Turnstile validation) ───
+# slowapi: per-IP rate limiting on Gemini-touching endpoints.
+# httpx is already pulled in by FastAPI; reused for Turnstile siteverify calls.
+slowapi>=0.1.9
 
 # ─── Scheduler ───
 apscheduler>=3.11.0,<4.0.0

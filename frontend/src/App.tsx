@@ -17,9 +17,14 @@ import { CrawlerPanel } from "./components/CrawlerPanel";
 import { RegulationsTable } from "./components/RegulationsTable";
 import { AgentActivityPanel } from "./components/AgentActivityPanel";
 import { CoverageMatrix } from "./components/CoverageMatrix";
+import { SettingsModal } from "./components/SettingsModal";
+import { TurnstileWidget } from "./components/TurnstileWidget";
+import { LiveCrawlPanel } from "./components/LiveCrawlPanel";
+import { useUserKeys } from "./hooks/useUserKeys";
 import type {
   AgentRun,
   AgentState,
+  BudgetState,
   CoverageRow,
   DashboardSummary,
   PolicyChange,
@@ -29,6 +34,7 @@ import type {
 } from "./types";
 
 const POLL_MS = 10000;
+const TURNSTILE_SITE_KEY = import.meta.env.VITE_TURNSTILE_SITE_KEY as string | undefined;
 
 export default function App() {
   const [summary, setSummary] = useState<DashboardSummary | null>(null);
@@ -39,12 +45,16 @@ export default function App() {
   const [agentRuns, setAgentRuns] = useState<AgentRun[]>([]);
   const [agentState, setAgentState] = useState<AgentState[]>([]);
   const [coverage, setCoverage] = useState<CoverageRow[]>([]);
+  const [budget, setBudget] = useState<BudgetState | null>(null);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+
+  const { keys, setKeys, hasLLMKey, hasScraperKey } = useUserKeys();
 
   const refresh = useCallback(async () => {
     try {
-      const [s, v, r, pc, se, runs, st, cov] = await Promise.all([
+      const [s, v, r, pc, se, runs, st, cov, b] = await Promise.all([
         api.summary(),
         api.listViolations(),
         api.listRegulations(),
@@ -53,6 +63,7 @@ export default function App() {
         api.listAgentRuns(),
         api.listAgentState(),
         api.listCoverage(),
+        api.getBudget().catch(() => null),
       ]);
       setSummary(s);
       setViolations(v);
@@ -62,6 +73,7 @@ export default function App() {
       setAgentRuns(runs);
       setAgentState(st);
       setCoverage(cov);
+      setBudget(b);
       setError(null);
       setActiveId((curr) => curr ?? v[0]?.violation_id ?? null);
     } catch (e) {
@@ -82,7 +94,20 @@ export default function App() {
 
   return (
     <div className="min-h-screen">
-      <Header pollMs={POLL_MS} apiUrl={API_BASE} onRefresh={refresh} />
+      <TurnstileWidget siteKey={TURNSTILE_SITE_KEY} />
+      <SettingsModal
+        open={settingsOpen}
+        initial={keys}
+        onSave={setKeys}
+        onClose={() => setSettingsOpen(false)}
+      />
+      <Header
+        pollMs={POLL_MS}
+        apiUrl={API_BASE}
+        onRefresh={refresh}
+        onOpenSettings={() => setSettingsOpen(true)}
+        byokActive={hasLLMKey || hasScraperKey}
+      />
 
       <main className="mx-auto max-w-[1500px] px-6 py-5">
         {error && (
@@ -154,6 +179,16 @@ export default function App() {
           </div>
         </section>
 
+        {/* Live crawl (BYOK end-to-end) */}
+        <section className="mb-5">
+          <LiveCrawlPanel
+            regulations={regulations}
+            budget={budget}
+            hasLLMKey={hasLLMKey}
+            onOpenSettings={() => setSettingsOpen(true)}
+          />
+        </section>
+
         {/* Violations + timeline */}
         <section className="mb-5 grid grid-cols-1 gap-3 lg:grid-cols-3">
           <div className="lg:col-span-1">
@@ -193,9 +228,9 @@ export default function App() {
           <div className="flex flex-wrap items-center gap-3 font-mono">
             <span>ClickHouse Cloud · regradar</span>
             <span>·</span>
-            <span>Source · Nimble · Policy Crawler</span>
+            <span>Scrape · Nimble → Firecrawl</span>
             <span>·</span>
-            <span>LLM tracing · Lapdog @ 127.0.0.1:8126</span>
+            <span>LLM · OpenRouter / Gemini (BYOK supported)</span>
           </div>
         </footer>
       </main>

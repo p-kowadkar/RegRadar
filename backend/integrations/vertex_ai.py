@@ -92,3 +92,99 @@ def vertex_model(model_name: str | None = None) -> Model:
     )
     log.info("llm.provider_initialized", path="vertex_adc", model=requested)
     return _MODEL
+
+
+# ════════════════════════════════════════════════════════════════
+# Per-request BYOK factory -- does NOT cache, does NOT mutate _MODEL
+# ════════════════════════════════════════════════════════════════
+
+
+# Locked OpenAI model -- only gpt-5.4-mini is supported for BYOK demos.
+# Reasoning model (released March 2026), uses max_completion_tokens internally,
+# defaults to medium reasoning_effort, ~$0.40/$1.60 per 1M tokens.
+_OPENAI_BYOK_MODEL = "gpt-5.4-mini"
+
+
+def vertex_model_for_user(
+    api_key: str,
+    provider: str,
+    model_name: str | None = None,
+) -> Model:
+    """Build a fresh Pydantic AI Model from a user-supplied key.
+
+    Used by the /api/trigger/crawl endpoint when X-User-LLM-Key is present.
+    Never touches the module-level _MODEL singleton -- safe to call per
+    request without polluting the server's default provider.
+
+    Args:
+        api_key: the user's API key.
+        provider: one of "openrouter" | "gemini" | "anthropic" | "openai".
+        model_name: provider-specific model id.
+            - openrouter: required-ish (e.g. "anthropic/claude-sonnet-4.5",
+              "google/gemini-2.5-flash"). Falls back to the singleton's mapped
+              slug when omitted.
+            - openai: IGNORED -- always uses gpt-5.4-mini.
+            - gemini: optional override; defaults to GEMINI_MODEL_DEFAULT.
+
+    Raises:
+        ValueError on unknown provider or empty OpenRouter model_name when
+        no fallback is configured.
+    """
+    requested = model_name or os.environ.get(
+        "GEMINI_MODEL_DEFAULT", "gemini-2.5-flash"
+    )
+    p = provider.lower().strip()
+
+    if p == "openrouter":
+        # If the user supplied an explicit OpenRouter slug, honor it verbatim.
+        # Otherwise translate our internal gemini-* name to the provider mapping.
+        slug = model_name.strip() if (model_name and model_name.strip()) else _OPENROUTER_MODEL_MAP.get(
+            requested, requested
+        )
+        log.info(
+            "llm.byok_model_built",
+            path="openrouter",
+            model=slug,
+            user_specified=bool(model_name),
+        )
+        return OpenAIChatModel(
+            model_name=slug,
+            provider=OpenRouterProvider(api_key=api_key),
+        )
+
+    if p == "gemini":
+        log.info("llm.byok_model_built", path="gemini_api_key", model=requested)
+        return GoogleModel(
+            model_name=requested,
+            provider=GoogleProvider(api_key=api_key),
+        )
+
+    if p == "anthropic":
+        # User brought a Claude key -- route via OpenRouter for cross-provider compat.
+        # Their key is forwarded to Anthropic; OpenRouter doesn't take a cut.
+        log.warning(
+            "llm.byok_anthropic_unsupported",
+            note="Direct Anthropic provider not wired; ask user to use OpenRouter key.",
+        )
+        raise ValueError(
+            "Anthropic BYOK requires routing through OpenRouter. "
+            "Use provider=openrouter with an OpenRouter key that includes Anthropic models."
+        )
+
+    if p == "openai":
+        from pydantic_ai.providers.openai import OpenAIProvider
+
+        # Hardcoded -- public BYOK demo only supports gpt-5.4-mini to keep
+        # cost predictable and avoid accidental gpt-5.5 / gpt-5-pro spend.
+        log.info(
+            "llm.byok_model_built",
+            path="openai",
+            model=_OPENAI_BYOK_MODEL,
+            note="OpenAI BYOK locked to gpt-5.4-mini regardless of model_name",
+        )
+        return OpenAIChatModel(
+            model_name=_OPENAI_BYOK_MODEL,
+            provider=OpenAIProvider(api_key=api_key),
+        )
+
+    raise ValueError(f"Unknown BYOK LLM provider: {provider}")

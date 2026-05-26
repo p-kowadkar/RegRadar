@@ -4,7 +4,7 @@
 
 > When a regulation changes, when a customer behaves a certain way, or when previously-invisible data becomes queryable — our agents go to work. They detect, classify, score the impact, update controls, and alert the right owner. No human had to ask. The system catches violations that have existed in the data for years but were never surfaced.
 
-Built for the **Agentic Engineering Hack — NYC** (Datadog, May 2026). Multi-agent system anchored on Pydantic AI, OpenRouter (Gemini 2.5 family), ClickHouse Cloud, Nimble, Firecrawl, and Datadog Lapdog (LLM Observability).
+Originally built for the **Agentic Engineering Hack — NYC** (Datadog, May 2026); now maintained for public release. Multi-agent system anchored on Pydantic AI, OpenRouter (Gemini 2.5 family by default), ClickHouse Cloud, Firecrawl (primary scraper) + Nimble (optional). Optional LLM observability via Pydantic Logfire or Datadog Lapdog — pick whichever you want, or skip both.
 
 ---
 
@@ -197,7 +197,7 @@ That's the full real loop, no fake data.
 | LLM | OpenRouter `google/gemini-2.5-flash` (default), Gemini API, or Vertex AI |
 | Data store | ClickHouse Cloud 25.8+ |
 | Scraping | Nimble Web Search Agents (`nimble_python` SDK) + Firecrawl fallback |
-| LLM observability | Datadog Lapdog (local) + ddtrace |
+| LLM observability | Optional: Pydantic Logfire (recommended for public deploys) or Datadog Lapdog (local) + ddtrace |
 | Frontend | React 18, Vite 5, TypeScript, Tailwind, Recharts, lucide-react |
 | Logging | structlog (JSON), Datadog trace correlation |
 

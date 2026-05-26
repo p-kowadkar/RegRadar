@@ -59,15 +59,29 @@ def _get_client() -> Nimble:
     return _CLIENT
 
 
-async def scrape_url(url: str) -> ScrapedDocument:
+def _client_for(api_key: str | None) -> Nimble:
+    """Per-request BYOK client. Falls back to the singleton when no override."""
+    if api_key:
+        return Nimble(api_key=api_key)
+    return _get_client()
+
+
+async def scrape_url(url: str, *, api_key_override: str | None = None) -> ScrapedDocument:
     """Scrape a single URL via Nimble's /extract endpoint.
+
+    Args:
+        url: target URL
+        api_key_override: optional user-provided Nimble key (BYOK). When set,
+            builds a fresh client per request and bills the user's account
+            instead of the server's.
 
     Returns markdown-formatted content.
     Raises NimbleError on failure -- caller decides whether to fall back to Firecrawl.
     """
     try:
+        client = _client_for(api_key_override)
         result = await asyncio.to_thread(
-            _get_client().extract,
+            client.extract,
             url=url,
             formats=["markdown"],
             render=False,
@@ -75,7 +89,12 @@ async def scrape_url(url: str) -> ScrapedDocument:
         # ExtractResponse: result.data.markdown
         content = (getattr(result.data, "markdown", None) or "") if getattr(result, "data", None) else ""
         h = sha256(content.encode()).hexdigest()
-        log.info("nimble.scrape_success", url=url, content_length=len(content))
+        log.info(
+            "nimble.scrape_success",
+            url=url,
+            content_length=len(content),
+            byok=bool(api_key_override),
+        )
         return ScrapedDocument(
             source_url=url,
             content_markdown=content,

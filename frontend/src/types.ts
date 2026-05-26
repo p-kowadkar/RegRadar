@@ -140,3 +140,65 @@ export interface CoverageRow {
   cde_count: number;
   open_violations: number;
 }
+
+// === BYOK + Trigger endpoints ===
+
+export type LLMProvider = "openrouter" | "gemini" | "openai";
+export type ScraperProvider = "firecrawl" | "nimble";
+
+export interface UserKeys {
+  llmKey: string;
+  llmProvider: LLMProvider | "";
+  llmModel: string;        // OpenRouter slug e.g. "anthropic/claude-sonnet-4.5"; ignored for openai (locked to gpt-5.4-mini)
+  scraperKey: string;
+  scraperProvider: ScraperProvider | "";
+}
+
+export interface BudgetState {
+  date_utc: string;
+  used: number;
+  budget: number;
+}
+
+export interface CrawlVerification {
+  threshold_days_confirmed: number | null;
+  threshold_label_confirmed: string;
+  control_name_confirmed: string;
+  is_material_change: boolean;
+  change_summary: string;
+  change_type:
+    | "no_change"
+    | "threshold_change"
+    | "scope_expansion"
+    | "clarification"
+    | "content_update";
+  new_version: string;
+  relevant_excerpt: string;
+}
+
+export interface CrawlResponse {
+  trigger_id: string;
+  regulation_id: string;
+  started_at: string;
+  elapsed_seconds: number;
+  used_byok: boolean;
+  used_byok_scraper: boolean;
+  notes: string[];
+  budget: BudgetState;
+  result: CrawlVerification | null;
+}
+
+export type TriggerScenario =
+  | "schema_enrichment_fcra"
+  | "dispute_filed"
+  | "promo_rate_expiry";
+
+export interface TriggerResponse {
+  trigger_id: string;
+  scenario: TriggerScenario;
+  started_at: string;
+  used_byok: boolean;
+  used_byok_scraper: boolean;
+  notes: string[];
+  budget: BudgetState;
+}

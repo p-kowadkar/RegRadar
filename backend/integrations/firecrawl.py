@@ -24,17 +24,35 @@ def _get_client() -> FirecrawlApp:
     return _CLIENT
 
 
-async def scrape_url(url: str) -> ScrapedDocument:
-    """Same return type as nimble.scrape_url — drop-in fallback."""
+def _client_for(api_key: str | None) -> FirecrawlApp:
+    """Per-request BYOK client. Falls back to the singleton when no override."""
+    if api_key:
+        return FirecrawlApp(api_key=api_key)
+    return _get_client()
+
+
+async def scrape_url(url: str, *, api_key_override: str | None = None) -> ScrapedDocument:
+    """Same return type as nimble.scrape_url — drop-in fallback.
+
+    Args:
+        url: target URL
+        api_key_override: optional user-provided Firecrawl key (BYOK)
+    """
     try:
+        client = _client_for(api_key_override)
         result = await asyncio.to_thread(
-            _get_client().scrape_url,
+            client.scrape_url,
             url,
             params={"formats": ["markdown"]},
         )
         content = result.get("markdown", "")
         h = sha256(content.encode()).hexdigest()
-        log.info("firecrawl.fallback_scrape_success", url=url, content_length=len(content))
+        log.info(
+            "firecrawl.fallback_scrape_success",
+            url=url,
+            content_length=len(content),
+            byok=bool(api_key_override),
+        )
         return ScrapedDocument(
             source_url=url,
             content_markdown=content,
