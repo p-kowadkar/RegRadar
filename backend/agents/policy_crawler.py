@@ -111,7 +111,7 @@ Rules:
 def _make_crawler_agent(model: Model | None = None) -> Agent:
     """Build a Pydantic AI Agent bound to either the singleton model or a BYOK override."""
     return Agent(
-        model=model or vertex_model("gemini-2.5-flash"),
+        model=model or vertex_model("gemini-3.5-flash"),
         output_type=CrawlVerification,
         system_prompt=_SYSTEM_PROMPT,
     )
