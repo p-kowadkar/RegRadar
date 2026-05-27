@@ -6,6 +6,8 @@
 
 Built for the **Agentic Engineering Hack — NYC** (Datadog, May 2026). Multi-agent system anchored on Pydantic AI, OpenRouter (Gemini 2.5 family), ClickHouse Cloud, Nimble, Firecrawl, and Datadog Lapdog (LLM Observability).
 
+Link to DevPost : https://devpost.com/software/regradar-0v3apw
+
 ---
 
 ## What you get
